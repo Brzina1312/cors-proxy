@@ -97,6 +97,9 @@ app.get('/proxy', async (req, res) => {
       return res.status(response.status).json({ error: 'Upstream error' });
     }
 
+    // Log successful response details for debugging
+    console.log(`[${new Date().toISOString()}] Proxy success: ${response.status}, Content-Type: ${response.headers.get('content-type') || 'none'}`);
+
     // Copy relevant headers
     res.status(response.status);
     

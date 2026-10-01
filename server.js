@@ -4,6 +4,13 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
+// Request queue to prevent portal rate limiting
+// Portal returns 429 if too many requests come too quickly
+const requestQueue = [];
+let isProcessingQueue = false;
+const MIN_REQUEST_INTERVAL = 200; // 200ms between requests to portal
+let lastRequestTime = 0;
+
 // CORS middleware
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -21,6 +28,44 @@ app.use((req, res, next) => {
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+// Process request queue with rate limiting
+async function processQueue() {
+  if (isProcessingQueue || requestQueue.length === 0) {
+    return;
+  }
+
+  isProcessingQueue = true;
+
+  while (requestQueue.length > 0) {
+    const { url, headers, resolve, reject } = requestQueue.shift();
+
+    // Wait if last request was too recent
+    const timeSinceLastRequest = Date.now() - lastRequestTime;
+    if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
+      const delay = MIN_REQUEST_INTERVAL - timeSinceLastRequest;
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+
+    try {
+      lastRequestTime = Date.now();
+      const response = await fetch(url, { headers });
+      resolve(response);
+    } catch (error) {
+      reject(error);
+    }
+  }
+
+  isProcessingQueue = false;
+}
+
+// Add request to queue and return promise
+function queueRequest(url, headers) {
+  return new Promise((resolve, reject) => {
+    requestQueue.push({ url, headers, resolve, reject });
+    processQueue();
+  });
+}
 
 // Proxy endpoint
 app.get('/proxy', async (req, res) => {
@@ -40,12 +85,11 @@ app.get('/proxy', async (req, res) => {
 
     console.log(`[${new Date().toISOString()}] Proxying: ${url}`);
 
-    // Fetch the stream
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'StreamNexus-Proxy/1.0',
-        ...(req.headers.range ? { 'Range': req.headers.range } : {})
-      }
+    // Queue the request to prevent rate limiting (portal returns 429)
+    // Spaces requests by at least 200ms
+    const response = await queueRequest(url, {
+      'User-Agent': 'StreamNexus-Proxy/1.0',
+      ...(req.headers.range ? { 'Range': req.headers.range } : {})
     });
 
     if (!response.ok) {

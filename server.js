@@ -315,7 +315,8 @@ class StreamManager {
           seqNum: this.currentSeqNum,
           data: segmentData,
           packetCount: this.currentSegmentPackets.length,
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          duration: actualDuration // Store actual duration for accurate HLS playlist
         });
         
         console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Segment ${this.currentSeqNum} complete (${this.currentSegmentPackets.length} packets, ${(segmentData.length/1024).toFixed(1)} KB, ${actualDuration.toFixed(2)}s, ${bitrateMbps} Mbps)${sizeExceeded ? ' [SIZE LIMIT]' : ''}`);
@@ -338,16 +339,22 @@ class StreamManager {
   getPlaylist(baseUrl, token) {
     this.lastAccessTime = Date.now();
     
+    // Calculate max segment duration for TARGETDURATION (HLS spec requirement)
+    const maxDuration = this.segments.length > 0
+      ? Math.max(...this.segments.map(s => s.duration || this.segmentDuration))
+      : this.segmentDuration;
+    
     const lines = [
       '#EXTM3U',
       '#EXT-X-VERSION:3',
-      `#EXT-X-TARGETDURATION:${this.segmentDuration}`,
+      `#EXT-X-TARGETDURATION:${Math.ceil(maxDuration)}`,
       `#EXT-X-MEDIA-SEQUENCE:${this.segments.length > 0 ? this.segments[0].seqNum : 0}`
     ];
     
-    // Add all available segments
+    // Add all available segments with their ACTUAL durations
     for (const seg of this.segments) {
-      lines.push(`#EXTINF:${this.segmentDuration}.0,`);
+      const duration = seg.duration || this.segmentDuration;
+      lines.push(`#EXTINF:${duration.toFixed(3)},`);
       lines.push(`${baseUrl}/stream/${token}/seg/${seg.seqNum}.ts`);
     }
     

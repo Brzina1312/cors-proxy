@@ -339,20 +339,30 @@ class StreamManager {
   getPlaylist(baseUrl, token) {
     this.lastAccessTime = Date.now();
     
+    // Minimum segments required before allowing playback to start
+    // This ensures 15-20 seconds of buffer before ExoPlayer begins
+    const MIN_SEGMENTS_FOR_PLAYBACK = 8;
+    
+    // Only expose segments if we have enough for smooth playback
+    // Otherwise return empty playlist to force initial buffering
+    const segmentsToExpose = this.segments.length >= MIN_SEGMENTS_FOR_PLAYBACK 
+      ? this.segments 
+      : [];
+    
     // Calculate max segment duration for TARGETDURATION (HLS spec requirement)
-    const maxDuration = this.segments.length > 0
-      ? Math.max(...this.segments.map(s => s.duration || this.segmentDuration))
+    const maxDuration = segmentsToExpose.length > 0
+      ? Math.max(...segmentsToExpose.map(s => s.duration || this.segmentDuration))
       : this.segmentDuration;
     
     const lines = [
       '#EXTM3U',
       '#EXT-X-VERSION:3',
       `#EXT-X-TARGETDURATION:${Math.ceil(maxDuration)}`,
-      `#EXT-X-MEDIA-SEQUENCE:${this.segments.length > 0 ? this.segments[0].seqNum : 0}`
+      `#EXT-X-MEDIA-SEQUENCE:${segmentsToExpose.length > 0 ? segmentsToExpose[0].seqNum : 0}`
     ];
     
     // Add all available segments with their ACTUAL durations
-    for (const seg of this.segments) {
+    for (const seg of segmentsToExpose) {
       const duration = seg.duration || this.segmentDuration;
       lines.push(`#EXTINF:${duration.toFixed(3)},`);
       lines.push(`${baseUrl}/stream/${token}/seg/${seg.seqNum}.ts`);

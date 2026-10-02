@@ -225,16 +225,14 @@ app.get('/stream/:token.m3u8', async (req, res) => {
     const baseUrl = req.protocol + '://' + req.get('host');
     const playlist = `#EXTM3U
 #EXT-X-VERSION:3
-#EXT-X-TARGETDURATION:3600
+#EXT-X-TARGETDURATION:10
 #EXT-X-MEDIA-SEQUENCE:0
-#EXT-X-PLAYLIST-TYPE:EVENT
-#EXTINF:3600.0,
-${baseUrl}/stream/${token}/live.ts
-#EXT-X-ENDLIST`;
+#EXTINF:10.0,
+${baseUrl}/stream/${token}/live.ts`;
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     
     res.send(playlist);
     console.log(`[${new Date().toISOString()}] HLS Playlist sent`);
@@ -300,87 +298,106 @@ app.get('/stream/:token/live.ts', async (req, res) => {
 
     console.log(`[${new Date().toISOString()}] HLS Stream START: user=${payload.userId}, ch=${payload.channelId}`);
 
-    // IMPROVED: Direct fetch with keep-alive (NO queue for streaming!)
-    const portalResponse = await fetch(streamUrl, {
-      headers: {
-        'User-Agent': 'StreamNexus-Proxy/1.0',
-        'Connection': 'keep-alive', // Keep portal connection alive
-        ...(req.headers.range ? { 'Range': req.headers.range } : {})
-      },
-      timeout: 30000 // 30 second timeout
-    });
-
-    if (!portalResponse.ok) {
-      console.error(`[${new Date().toISOString()}] Portal error: ${portalResponse.status}`);
-      return res.status(portalResponse.status).json({ error: 'Portal error' });
-    }
-
-    console.log(`[${new Date().toISOString()}] Portal connected, starting PTS normalization`);
-
-    // Response headers
+    // Response headers (set before streaming starts)
     res.status(200);
     res.setHeader('Content-Type', 'video/mp2t');
     res.setHeader('Accept-Ranges', 'none');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Access-Control-Allow-Origin', '*');
 
-    // Create normalizer
+    // Create normalizer (persists across reconnections for continuous timestamps)
     const normalizer = new MPEGTSNormalizer();
     let packetBuffer = Buffer.alloc(0);
-    let packetsProcessed = 0;
-    let bytesReceived = 0;
+    let totalPacketsProcessed = 0;
+    let totalBytesReceived = 0;
     let lastLogTime = Date.now();
+    let reconnectAttempts = 0;
+    const MAX_RECONNECT_ATTEMPTS = 20;
+    let keepStreaming = true;
 
-    console.log(`[${new Date().toISOString()}] Starting packet processing loop`);
+    // Handle client disconnect
+    req.on('close', () => {
+      console.log(`[${new Date().toISOString()}] Client disconnected`);
+      keepStreaming = false;
+    });
 
-    try {
-      // Process stream with proper error handling
-      for await (const chunk of portalResponse.body) {
-        bytesReceived += chunk.length;
-        packetBuffer = Buffer.concat([packetBuffer, chunk]);
+    console.log(`[${new Date().toISOString()}] Starting streaming with auto-reconnect`);
 
-        // Process complete 188-byte packets immediately
-        while (packetBuffer.length >= 188) {
-          const packet = packetBuffer.slice(0, 188);
-          packetBuffer = packetBuffer.slice(188);
+    // Reconnection loop
+    while (keepStreaming && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      try {
+        // Connect to portal
+        const portalResponse = await fetch(streamUrl, {
+          headers: {
+            'User-Agent': 'StreamNexus-Proxy/1.0',
+            'Connection': 'keep-alive',
+            ...(req.headers.range ? { 'Range': req.headers.range } : {})
+          },
+          timeout: 30000
+        });
 
-          const normalizedPacket = normalizer.normalizePacket(packet);
-          
-          // Send immediately to client (no buffering)
-          if (!res.write(normalizedPacket)) {
-            // Client can't keep up, back pressure
-            await new Promise(resolve => res.once('drain', resolve));
-          }
-          
-          packetsProcessed++;
+        if (!portalResponse.ok) {
+          console.error(`[${new Date().toISOString()}] Portal error: ${portalResponse.status}, reconnecting...`);
+          reconnectAttempts++;
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          continue;
+        }
 
-          // Log progress every 5 seconds
-          if (Date.now() - lastLogTime > 5000) {
-            console.log(`[${new Date().toISOString()}] Streaming: ${packetsProcessed} packets, ${(bytesReceived/1024/1024).toFixed(2)} MB`);
-            lastLogTime = Date.now();
+        console.log(`[${new Date().toISOString()}] Portal connected (attempt ${reconnectAttempts + 1})`);
+        
+        let sessionPackets = 0;
+        let sessionBytes = 0;
+
+        // Process stream
+        for await (const chunk of portalResponse.body) {
+          if (!keepStreaming) break;
+
+          sessionBytes += chunk.length;
+          totalBytesReceived += chunk.length;
+          packetBuffer = Buffer.concat([packetBuffer, chunk]);
+
+          // Process complete 188-byte packets
+          while (packetBuffer.length >= 188) {
+            const packet = packetBuffer.slice(0, 188);
+            packetBuffer = packetBuffer.slice(188);
+
+            const normalizedPacket = normalizer.normalizePacket(packet);
+            
+            // Send to client with back pressure handling
+            if (!res.write(normalizedPacket)) {
+              await new Promise(resolve => res.once('drain', resolve));
+            }
+            
+            sessionPackets++;
+            totalPacketsProcessed++;
+
+            // Log progress every 5 seconds
+            if (Date.now() - lastLogTime > 5000) {
+              console.log(`[${new Date().toISOString()}] Streaming: ${totalPacketsProcessed} packets (${sessionPackets} this session), ${(totalBytesReceived/1024/1024).toFixed(2)} MB`);
+              lastLogTime = Date.now();
+            }
           }
         }
-      }
 
-      // Stream ended normally
-      console.log(`[${new Date().toISOString()}] Portal stream ended normally. Total: ${packetsProcessed} packets, ${(bytesReceived/1024/1024).toFixed(2)} MB`);
-      res.end();
-      
-    } catch (streamError) {
-      console.error(`[${new Date().toISOString()}] Stream error:`, streamError.message);
-      console.error(`[${new Date().toISOString()}] Error details:`, {
-        code: streamError.code,
-        errno: streamError.errno,
-        packetsProcessed,
-        bytesReceived
-      });
-      
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Stream error' });
-      } else {
-        res.end();
+        // Portal disconnected, attempt reconnect
+        if (keepStreaming) {
+          console.log(`[${new Date().toISOString()}] Portal disconnected after ${sessionPackets} packets (${(sessionBytes/1024/1024).toFixed(2)} MB), reconnecting...`);
+          reconnectAttempts++;
+          await new Promise(resolve => setTimeout(resolve, 100)); // Brief delay before reconnect
+        }
+        
+      } catch (streamError) {
+        console.error(`[${new Date().toISOString()}] Stream error:`, streamError.message);
+        if (!keepStreaming) break;
+        
+        reconnectAttempts++;
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
     }
+
+    // Stream ended
+    console.log(`[${new Date().toISOString()}] Stream ended. Total: ${totalPacketsProcessed} packets, ${(totalBytesReceived/1024/1024).toFixed(2)} MB, ${reconnectAttempts} reconnections`);
+    res.end();
 
   } catch (error) {
     console.error(`[${new Date().toISOString()}] Handler error:`, error.message, error.stack);

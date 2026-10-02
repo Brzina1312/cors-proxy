@@ -204,6 +204,88 @@ class MPEGTSNormalizer {
 // Background worker continuously creates segments from portal stream
 const sessionNormalizers = new Map(); // token -> {normalizer, segments, isBuffering, ...}
 
+// Protection: Per-user rate limiting
+const userStreamLimits = new Map(); // userId -> {activeStreams: Set, lastStreamStart: timestamp, 429Until: timestamp}
+const MAX_ACTIVE_STREAMS_PER_USER = 3; // Allow multiple devices per user
+const MIN_STREAM_START_INTERVAL = 2000; // 2 seconds between new streams
+const STREAM_START_TIMEOUT = 15000; // 15 seconds to create first segment or mark broken
+
+// Protection: Broken channel detection
+const brokenChannels = new Map(); // channelId -> blockedUntil timestamp
+const BROKEN_CHANNEL_COOLDOWN = 5 * 60 * 1000; // 5 minutes
+
+function canUserStartStream(userId) {
+  const now = Date.now();
+  const limits = userStreamLimits.get(userId);
+  
+  if (!limits) {
+    userStreamLimits.set(userId, {
+      activeStreams: new Set(),
+      lastStreamStart: now,
+      _429Until: null
+    });
+    return { allowed: true };
+  }
+  
+  // Check if user is in 429 cooldown
+  if (limits._429Until && now < limits._429Until) {
+    const waitSeconds = Math.ceil((limits._429Until - now) / 1000);
+    return { allowed: false, reason: `Rate limited, wait ${waitSeconds}s` };
+  }
+  
+  // Check active stream limit
+  if (limits.activeStreams.size >= MAX_ACTIVE_STREAMS_PER_USER) {
+    return { allowed: false, reason: `Max ${MAX_ACTIVE_STREAMS_PER_USER} concurrent streams` };
+  }
+  
+  // Check minimum interval between starts
+  if (now - limits.lastStreamStart < MIN_STREAM_START_INTERVAL) {
+    return { allowed: false, reason: 'Too many requests, slow down' };
+  }
+  
+  limits.lastStreamStart = now;
+  return { allowed: true };
+}
+
+function isChannelBroken(channelId) {
+  const blockedUntil = brokenChannels.get(channelId);
+  if (blockedUntil && Date.now() < blockedUntil) {
+    return true;
+  }
+  if (blockedUntil) {
+    brokenChannels.delete(channelId); // Cooldown expired
+  }
+  return false;
+}
+
+function markChannelBroken(channelId, reason) {
+  const blockedUntil = Date.now() + BROKEN_CHANNEL_COOLDOWN;
+  brokenChannels.set(channelId, blockedUntil);
+  console.log(`[${new Date().toISOString()}] Channel ${channelId} marked as broken (${reason}), blocked for 5 min`);
+}
+
+function recordUser429(userId) {
+  const limits = userStreamLimits.get(userId);
+  if (limits) {
+    limits._429Until = Date.now() + 30000; // 30 second cooldown for this user
+    console.log(`[${new Date().toISOString()}] User ${userId} hit 429, cooldown 30s`);
+  }
+}
+
+function registerActiveStream(userId, token) {
+  const limits = userStreamLimits.get(userId);
+  if (limits) {
+    limits.activeStreams.add(token);
+  }
+}
+
+function unregisterActiveStream(userId, token) {
+  const limits = userStreamLimits.get(userId);
+  if (limits) {
+    limits.activeStreams.delete(token);
+  }
+}
+
 // Cleanup inactive sessions every 60 seconds
 setInterval(() => {
   const now = Date.now();
@@ -228,7 +310,19 @@ setInterval(() => {
         }
       }
       
+      // Unregister from user's active streams
+      if (session.userId) {
+        unregisterActiveStream(session.userId, token);
+      }
+      
       sessionNormalizers.delete(token);
+    }
+  }
+  
+  // Cleanup old user limit entries (no active streams and last activity > 10 min)
+  for (const [userId, limits] of userStreamLimits.entries()) {
+    if (limits.activeStreams.size === 0 && now - limits.lastStreamStart > 10 * 60 * 1000) {
+      userStreamLimits.delete(userId);
     }
   }
 }, 60000);
@@ -310,6 +404,18 @@ async function startBuffering(session, token) {
         
         if (!portalResponse.ok) {
           console.error(`[${new Date().toISOString()}] Buffering: Portal error ${portalResponse.status}`);
+          
+          // Handle 429 (Too Many Requests) - user-specific cooldown
+          if (portalResponse.status === 429 && session.userId) {
+            recordUser429(session.userId);
+            // Also mark channel as broken to prevent other users from hitting it immediately
+            if (session.channelId) {
+              markChannelBroken(session.channelId, '429 rate limit');
+            }
+            session.isBuffering = false;
+            break;
+          }
+          
           reconnectAttempts++;
           await new Promise(resolve => setTimeout(resolve, 2000));
           continue;
@@ -399,6 +505,17 @@ async function startBuffering(session, token) {
           segmentStartPTS = null;
           lastPTS = null;
         }
+        
+        // Protection: Check for broken channel (no segments created within timeout)
+        if (session.segments.length === 0 && session.startTime && 
+            Date.now() - session.startTime > STREAM_START_TIMEOUT) {
+          console.error(`[${new Date().toISOString()}] Buffering: Stream failed to create segments within ${STREAM_START_TIMEOUT/1000}s, marking as broken`);
+          if (session.channelId) {
+            markChannelBroken(session.channelId, 'timeout - no segments');
+          }
+          session.isBuffering = false;
+          break;
+        }
       }
       
     } catch (error) {
@@ -445,18 +562,38 @@ app.get('/stream/:token.m3u8', async (req, res) => {
     // Get or create session for this token
     let session = sessionNormalizers.get(token);
     if (!session) {
+      // Protection: Check if user can start new stream
+      const canStart = canUserStartStream(payload.userId);
+      if (!canStart.allowed) {
+        console.warn(`[${new Date().toISOString()}] User ${payload.userId} blocked: ${canStart.reason}`);
+        return res.status(429).json({ error: canStart.reason });
+      }
+      
+      // Protection: Check if channel is broken
+      if (isChannelBroken(payload.channelId)) {
+        console.warn(`[${new Date().toISOString()}] Channel ${payload.channelId} is marked as broken`);
+        return res.status(503).json({ error: 'Channel temporarily unavailable' });
+      }
+      
       session = {
         normalizer: new MPEGTSNormalizer(),
         lastAccess: Date.now(),
         streamUrl: payload.streamUrl,
+        userId: payload.userId,
+        channelId: payload.channelId,
         segments: [], // Buffer of available segments
         currentSeqNum: 0, // Next segment number to create
         isBuffering: false,
         portalStream: null,
-        portalResponse: null
+        portalResponse: null,
+        startTime: Date.now() // Track when stream started for timeout detection
       };
       sessionNormalizers.set(token, session);
-      console.log(`[${new Date().toISOString()}] New session created for user ${payload.userId}`);
+      
+      // Register as active stream for this user
+      registerActiveStream(payload.userId, token);
+      
+      console.log(`[${new Date().toISOString()}] New session created for user ${payload.userId}, channel ${payload.channelId}`);
       
       // Start background buffering
       startBuffering(session, token);

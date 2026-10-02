@@ -158,11 +158,16 @@ app.get('/stream/:token', async (req, res) => {
     }
 
     // Validate JWT token
+    console.log(`[${new Date().toISOString()}] Received token (first 100 chars):`, token.substring(0, 100));
+    console.log(`[${new Date().toISOString()}] Token length:`, token.length);
+    console.log(`[${new Date().toISOString()}] Token parts count:`, token.split('.').length);
+    
     let payload;
     try {
       payload = jwt.verify(token, JWT_SECRET);
     } catch (jwtError) {
       console.error(`[${new Date().toISOString()}] Invalid JWT token:`, jwtError.message);
+      console.error(`[${new Date().toISOString()}] Token that failed:`, token.substring(0, 100), '...');
       return res.status(403).json({ error: 'Invalid or expired token' });
     }
 

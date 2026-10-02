@@ -233,9 +233,28 @@ function canUserStartStream(userId) {
     return { allowed: false, reason: `Rate limited, wait ${waitSeconds}s` };
   }
   
-  // Check active stream limit
+  // Smart cleanup: If user is at limit, check for idle streams and clean them up first
   if (limits.activeStreams.size >= MAX_ACTIVE_STREAMS_PER_USER) {
-    return { allowed: false, reason: `Max ${MAX_ACTIVE_STREAMS_PER_USER} concurrent streams` };
+    const idleTokens = [];
+    for (const token of limits.activeStreams) {
+      const session = sessionNormalizers.get(token);
+      if (session && now - session.lastAccess > 10000) { // Idle for 10+ seconds
+        idleTokens.push(token);
+      }
+    }
+    
+    // Clean up idle streams to make room
+    if (idleTokens.length > 0) {
+      console.log(`[${new Date().toISOString()}] Smart cleanup: Removing ${idleTokens.length} idle streams for user ${userId}`);
+      for (const token of idleTokens) {
+        cleanupSession(token, 'idle stream cleanup');
+      }
+    }
+    
+    // Recheck limit after cleanup
+    if (limits.activeStreams.size >= MAX_ACTIVE_STREAMS_PER_USER) {
+      return { allowed: false, reason: `Max ${MAX_ACTIVE_STREAMS_PER_USER} concurrent streams` };
+    }
   }
   
   // Check minimum interval between starts
@@ -286,36 +305,47 @@ function unregisterActiveStream(userId, token) {
   }
 }
 
-// Cleanup inactive sessions every 60 seconds
+// Immediately clean up a session (called on errors, disconnects, etc.)
+function cleanupSession(token, reason = 'cleanup') {
+  const session = sessionNormalizers.get(token);
+  if (!session) return;
+  
+  console.log(`[${new Date().toISOString()}] Cleanup: ${reason} for session ${token.substring(0, 8)}`);
+  
+  // Stop buffering worker
+  session.isBuffering = false;
+  
+  // Close portal connection
+  if (session.portalResponse) {
+    try {
+      session.portalResponse.body.cancel();
+    } catch (e) {
+      // Ignore errors during cleanup
+    }
+  }
+  
+  // Unregister from user's active streams
+  if (session.userId) {
+    unregisterActiveStream(session.userId, token);
+  }
+  
+  // Clear segments to free memory immediately
+  if (session.segments) {
+    session.segments = [];
+  }
+  
+  // Delete session
+  sessionNormalizers.delete(token);
+}
+
+// Cleanup inactive sessions every 30 seconds
 setInterval(() => {
   const now = Date.now();
-  const INACTIVE_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+  const INACTIVE_TIMEOUT = 30 * 1000; // 30 seconds (reduced from 5 minutes)
   
   for (const [token, session] of sessionNormalizers.entries()) {
     if (now - session.lastAccess > INACTIVE_TIMEOUT) {
-      console.log(`[${new Date().toISOString()}] Cleanup: Removing inactive session for token ${token.substring(0, 8)}...`);
-      
-      // Stop buffering worker
-      if (session.isBuffering) {
-        session.isBuffering = false;
-        console.log(`[${new Date().toISOString()}] Cleanup: Stopped buffering for session ${token.substring(0, 8)}`);
-      }
-      
-      // Close portal connection if open
-      if (session.portalResponse) {
-        try {
-          session.portalResponse.body.cancel();
-        } catch (e) {
-          // Ignore errors during cleanup
-        }
-      }
-      
-      // Unregister from user's active streams
-      if (session.userId) {
-        unregisterActiveStream(session.userId, token);
-      }
-      
-      sessionNormalizers.delete(token);
+      cleanupSession(token, 'inactive for 30s');
     }
   }
   
@@ -325,7 +355,7 @@ setInterval(() => {
       userStreamLimits.delete(userId);
     }
   }
-}, 60000);
+}, 30000); // Run every 30 seconds to match INACTIVE_TIMEOUT
 
 // ============================================
 // Background Buffering Worker (Per-Session)
@@ -412,7 +442,8 @@ async function startBuffering(session, token) {
             if (session.channelId) {
               markChannelBroken(session.channelId, '429 rate limit');
             }
-            session.isBuffering = false;
+            // Immediately clean up to free memory and unregister stream
+            cleanupSession(token, '429 rate limit error');
             break;
           }
           
@@ -513,7 +544,8 @@ async function startBuffering(session, token) {
           if (session.channelId) {
             markChannelBroken(session.channelId, 'timeout - no segments');
           }
-          session.isBuffering = false;
+          // Immediately clean up to free memory and unregister stream
+          cleanupSession(token, 'timeout - no segments');
           break;
         }
       }

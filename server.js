@@ -198,223 +198,12 @@ class MPEGTSNormalizer {
 }
 
 // ============================================
-// HLS Stream Manager (Segmented Live Streaming)
+// Simple HLS Streaming (No Shared State)
 // ============================================
-class StreamManager {
-  constructor(channelId, streamUrl) {
-    this.channelId = channelId;
-    this.streamUrl = streamUrl;
-    this.segments = []; // [{seqNum, data: Buffer, packetCount}]
-    this.currentSeqNum = 0;
-    this.currentSegmentPackets = [];
-    this.currentSegmentSize = 0; // Track segment size incrementally
-    this.currentSegmentStartTime = null; // Track when current segment started
-    this.segmentDuration = 2; // seconds per segment (shorter for faster cold start)
-    this.maxSegments = 30; // Keep 30 segments = 60 seconds buffer
-    this.normalizer = new MPEGTSNormalizer();
-    this.lastAccessTime = Date.now();
-    this.isRunning = false;
-    this.startTime = null;
-    this.totalPackets = 0;
-    this.activeUsers = 0; // Track how many users are watching
-  }
-  
-  async startFetching() {
-    if (this.isRunning) return;
-    
-    this.isRunning = true;
-    
-    console.log(`[${new Date().toISOString()}] StreamManager: Starting fetch for channel ${this.channelId}`);
-    
-    this.fetchLoop();
-  }
-  
-  async fetchLoop() {
-    while (this.isRunning) {
-      try {
-        console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Connecting to portal...`);
-        
-        const response = await fetch(this.streamUrl, {
-          headers: {
-            'User-Agent': 'StreamNexus-Proxy/1.0',
-            'Connection': 'keep-alive'
-          },
-          timeout: 30000
-        });
-        
-        if (!response.ok) {
-          console.error(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Portal error ${response.status}`);
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          continue;
-        }
-        
-        console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Portal connected`);
-        
-        let packetBuffer = Buffer.alloc(0);
-        
-        for await (const chunk of response.body) {
-          if (!this.isRunning) break;
-          
-          packetBuffer = Buffer.concat([packetBuffer, chunk]);
-          
-          while (packetBuffer.length >= 188) {
-            const packet = packetBuffer.slice(0, 188);
-            packetBuffer = packetBuffer.slice(188);
-            
-            const normalizedPacket = this.normalizer.normalizePacket(packet);
-            this.addPacket(normalizedPacket);
-          }
-        }
-        
-        // Check if stopped before attempting reconnect
-        if (!this.isRunning) {
-          console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Stopped`);
-          break;
-        }
-        
-        console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Portal disconnected, reconnecting...`);
-        await new Promise(resolve => setTimeout(resolve, 100));
-        
-      } catch (error) {
-        console.error(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Error:`, error.message);
-        if (this.isRunning) {
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
-      }
-    }
-  }
-  
-  addPacket(packet) {
-    // Set startTime on first packet arrival (fixes cold start timing bug)
-    if (!this.startTime) {
-      this.startTime = Date.now();
-      this.currentSegmentStartTime = Date.now(); // Initialize segment timer
-    }
-    
-    this.currentSegmentPackets.push(packet);
-    this.currentSegmentSize += packet.length; // Track size incrementally
-    this.totalPackets++;
-    
-    // Calculate elapsed time for CURRENT segment (not global time)
-    const segmentElapsed = (Date.now() - this.currentSegmentStartTime) / 1000;
-    
-    // Size limit: 5 MB per segment to prevent memory issues and decoder overload
-    const MAX_SEGMENT_SIZE = 5 * 1024 * 1024; // 5 MB
-    const sizeExceeded = this.currentSegmentSize >= MAX_SEGMENT_SIZE;
-    const timeElapsed = segmentElapsed >= this.segmentDuration;
-    
-    // Finalize segment if time elapsed OR size limit reached
-    if (timeElapsed || sizeExceeded) {
-      // Finalize current segment
-      if (this.currentSegmentPackets.length > 0) {
-        const segmentData = Buffer.concat(this.currentSegmentPackets);
-        const actualDuration = segmentElapsed; // Use actual measured duration
-        const bitrateMbps = (segmentData.length * 8 / actualDuration / 1000000).toFixed(2);
-        
-        this.segments.push({
-          seqNum: this.currentSeqNum,
-          data: segmentData,
-          packetCount: this.currentSegmentPackets.length,
-          timestamp: Date.now(),
-          duration: actualDuration // Store actual duration for accurate HLS playlist
-        });
-        
-        console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Segment ${this.currentSeqNum} complete (${this.currentSegmentPackets.length} packets, ${(segmentData.length/1024).toFixed(1)} KB, ${actualDuration.toFixed(2)}s, ${bitrateMbps} Mbps)${sizeExceeded ? ' [SIZE LIMIT]' : ''}`);
-        
-        // Keep only last N segments
-        while (this.segments.length > this.maxSegments) {
-          const removed = this.segments.shift();
-          console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Dropped segment ${removed.seqNum}`);
-        }
-      }
-      
-      // Start new segment
-      this.currentSeqNum++;
-      this.currentSegmentPackets = [];
-      this.currentSegmentSize = 0; // Reset size counter
-      this.currentSegmentStartTime = Date.now(); // Reset segment timer
-    }
-  }
-  
-  getPlaylist(baseUrl, token) {
-    this.lastAccessTime = Date.now();
-    
-    // Minimum segments required before allowing playback to start
-    // This ensures 15-20 seconds of buffer before ExoPlayer begins
-    const MIN_SEGMENTS_FOR_PLAYBACK = 8;
-    
-    // Only expose segments if we have enough for smooth playback
-    // Otherwise return empty playlist to force initial buffering
-    const segmentsToExpose = this.segments.length >= MIN_SEGMENTS_FOR_PLAYBACK 
-      ? this.segments 
-      : [];
-    
-    // Calculate max segment duration for TARGETDURATION (HLS spec requirement)
-    const maxDuration = segmentsToExpose.length > 0
-      ? Math.max(...segmentsToExpose.map(s => s.duration || this.segmentDuration))
-      : this.segmentDuration;
-    
-    const lines = [
-      '#EXTM3U',
-      '#EXT-X-VERSION:3',
-      `#EXT-X-TARGETDURATION:${Math.ceil(maxDuration)}`,
-      `#EXT-X-MEDIA-SEQUENCE:${segmentsToExpose.length > 0 ? segmentsToExpose[0].seqNum : 0}`
-    ];
-    
-    // Add all available segments with their ACTUAL durations
-    for (const seg of segmentsToExpose) {
-      const duration = seg.duration || this.segmentDuration;
-      lines.push(`#EXTINF:${duration.toFixed(3)},`);
-      lines.push(`${baseUrl}/stream/${token}/seg/${seg.seqNum}.ts`);
-    }
-    
-    return lines.join('\n');
-  }
-  
-  getSegment(seqNum) {
-    this.lastAccessTime = Date.now();
-    const segment = this.segments.find(s => s.seqNum === seqNum);
-    return segment ? segment.data : null;
-  }
-  
-  stop() {
-    console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Stopping (total packets: ${this.totalPackets})`);
-    this.isRunning = false;
-  }
-}
-
-// Global stream managers (shared by channelId for scalability)
-const streamManagers = new Map(); // channelId -> StreamManager
-
-// Cleanup inactive streams every 30 seconds
-setInterval(() => {
-  const now = Date.now();
-  for (const [channelId, manager] of streamManagers.entries()) {
-    const timeSinceLastAccess = now - manager.lastAccessTime;
-    
-    // Get timestamp of most recent segment to check if stream is still creating segments
-    const lastSegmentTime = manager.segments.length > 0 
-      ? manager.segments[manager.segments.length - 1].timestamp 
-      : manager.startTime || manager.lastAccessTime;
-    
-    const timeSinceLastSegment = now - lastSegmentTime;
-    
-    // Only cleanup if BOTH:
-    // 1. No access (playlist/segment requests) for 5 minutes AND
-    // 2. No new segments created for 5 minutes (stream actually dead)
-    // This prevents killing active streams when ExoPlayer is just buffering
-    const isInactive = timeSinceLastAccess > 300000 && timeSinceLastSegment > 300000;
-    
-    if (isInactive) {
-      console.log(`[${new Date().toISOString()}] Cleanup: Removing inactive stream for channel ${channelId} (last access: ${(timeSinceLastAccess/1000).toFixed(0)}s ago, last segment: ${(timeSinceLastSegment/1000).toFixed(0)}s ago)`);
-      manager.stop();
-      streamManagers.delete(channelId);
-    }
-  }
-}, 30000);
+// StreamManager removed - each request gets independent stream
 
 // ============================================
-// HLS Playlist Endpoint
+// HLS Playlist Endpoint (Simplified - No StreamManager)
 // ============================================
 app.get('/stream/:token.m3u8', async (req, res) => {
   try {
@@ -438,93 +227,28 @@ app.get('/stream/:token.m3u8', async (req, res) => {
 
     console.log(`[${new Date().toISOString()}] HLS Playlist request: userId=${payload.userId}, ch=${payload.channelId}`);
 
-    // Get or create StreamManager (shared by channel for scalability)
-    const channelId = payload.channelId;
-    let manager = streamManagers.get(channelId);
-    if (!manager) {
-      console.log(`[${new Date().toISOString()}] Creating new StreamManager for ch=${channelId}`);
-      manager = new StreamManager(channelId, payload.streamUrl);
-      streamManagers.set(channelId, manager);
-      manager.startFetching(); // Start background fetching
-    } else {
-      console.log(`[${new Date().toISOString()}] Reusing StreamManager for ch=${channelId} (${manager.activeUsers} active users)`);
-    }
-    manager.activeUsers++;
-
+    // Simple static playlist pointing to continuous live.ts stream
     const baseUrl = req.protocol + '://' + req.get('host');
-    const playlist = manager.getPlaylist(baseUrl, token);
+    const playlist = [
+      '#EXTM3U',
+      '#EXT-X-VERSION:3',
+      '#EXT-X-TARGETDURATION:3600',
+      '#EXT-X-MEDIA-SEQUENCE:0',
+      '#EXTINF:3600.000,',
+      `${baseUrl}/stream/${token}/live.ts`
+    ].join('\n');
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     
     res.send(playlist);
-    console.log(`[${new Date().toISOString()}] HLS Playlist sent (${manager.segments.length} segments, ${manager.activeUsers} users)`);
+    console.log(`[${new Date().toISOString()}] HLS Playlist sent (simple continuous stream)`);
 
   } catch (error) {
     console.error(`[${new Date().toISOString()}] HLS playlist error:`, error.message);
     if (!res.headersSent) {
       res.status(500).json({ error: 'Playlist error' });
-    }
-  }
-});
-
-// ============================================
-// HLS Segment Endpoint (Segmented Live Streaming)
-// ============================================
-app.get('/stream/:token/seg/:seqNum.ts', async (req, res) => {
-  try {
-    let { token, seqNum } = req.params;
-    seqNum = parseInt(seqNum);
-    
-    if (!token || isNaN(seqNum) || !JWT_SECRET) {
-      return res.status(400).json({ error: 'Missing parameters' });
-    }
-
-    let payload;
-    try {
-      payload = jwt.verify(token, JWT_SECRET);
-    } catch (jwtError) {
-      console.error(`[${new Date().toISOString()}] Invalid JWT for segment:`, jwtError.message);
-      return res.status(403).json({ error: 'Invalid token' });
-    }
-
-    if (payload.type !== 'stream') {
-      return res.status(403).json({ error: 'Invalid token type' });
-    }
-
-    console.log(`[${new Date().toISOString()}] Segment request: ch=${payload.channelId}, seq=${seqNum}`);
-
-    // Get StreamManager by channelId
-    const channelId = payload.channelId;
-    const manager = streamManagers.get(channelId);
-    if (!manager) {
-      console.error(`[${new Date().toISOString()}] No StreamManager found for channel ${channelId}`);
-      return res.status(404).json({ error: 'Stream not found' });
-    }
-
-    // Get segment data
-    const segmentData = manager.getSegment(seqNum);
-    if (!segmentData) {
-      console.warn(`[${new Date().toISOString()}] Segment ${seqNum} not available (may have been dropped)`);
-      return res.status(404).json({ error: 'Segment not available' });
-    }
-
-    console.log(`[${new Date().toISOString()}] Serving segment ${seqNum} (${(segmentData.length/1024).toFixed(1)} KB)`);
-
-    // Send segment
-    res.status(200);
-    res.setHeader('Content-Type', 'video/mp2t');
-    res.setHeader('Content-Length', segmentData.length);
-    res.setHeader('Accept-Ranges', 'none');
-    res.setHeader('Cache-Control', 'public, max-age=86400'); // Segments are immutable
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.send(segmentData);
-
-  } catch (error) {
-    console.error(`[${new Date().toISOString()}] Segment error:`, error.message);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Segment error' });
     }
   }
 });

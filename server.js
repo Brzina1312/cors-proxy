@@ -148,7 +148,8 @@ app.get('/proxy', async (req, res) => {
 
 // Token-based streaming endpoint (ExoPlayer compatible)
 // No redirects, direct HTTPS streaming with JWT validation
-app.get('/stream/:token', async (req, res) => {
+// Now with pre-buffering and ExoPlayer-specific optimizations
+app.get('/stream/:token.:ext?', async (req, res) => {
   try {
     const { token } = req.params;
     
@@ -186,7 +187,6 @@ app.get('/stream/:token', async (req, res) => {
     }
 
     // Rate limiting: Prevent portal 456 errors (Load Limit Reached)
-    // Portal blocks MAC if too many requests come too fast
     const userId = payload.userId;
     const now = Date.now();
     
@@ -195,7 +195,6 @@ app.get('/stream/:token', async (req, res) => {
     }
     
     const userRequests = userRequestTracker.get(userId);
-    // Remove requests older than window
     const recentRequests = userRequests.filter(time => now - time < USER_REQUEST_WINDOW);
     
     if (recentRequests.length >= USER_REQUEST_LIMIT) {
@@ -210,7 +209,6 @@ app.get('/stream/:token', async (req, res) => {
       });
     }
     
-    // Add current request
     recentRequests.push(now);
     userRequestTracker.set(userId, recentRequests);
 
@@ -237,40 +235,20 @@ app.get('/stream/:token', async (req, res) => {
       return res.status(response.status).json({ error: 'Upstream error' });
     }
 
-    console.log(`[${new Date().toISOString()}] Stream success: ${response.status}, Content-Type: ${response.headers.get('content-type') || 'none'}`);
+    console.log(`[${new Date().toISOString()}] Stream success: ${response.status}, starting buffered stream`);
 
-    // Copy relevant headers
-    res.status(response.status);
+    // ExoPlayer-optimized headers
+    res.status(200);
     
-    const contentType = response.headers.get('content-type');
-    if (contentType) {
-      // Add codecs parameter for ExoPlayer compatibility
-      if (contentType.includes('video/mp2t') || contentType.includes('video/MP2T')) {
-        // Most IPTV streams use H.264 High Profile + AAC-LC
-        res.setHeader('Content-Type', 'video/mp2t; codecs="avc1.640028, mp4a.40.2"');
-      } else {
-        res.setHeader('Content-Type', contentType);
-      }
-    } else {
-      // Default MPEG-TS with codecs
-      res.setHeader('Content-Type', 'video/mp2t; codecs="avc1.640028, mp4a.40.2"');
-    }
-
-    const contentLength = response.headers.get('content-length');
-    if (contentLength) {
-      res.setHeader('Content-Length', contentLength);
-    }
-
-    const contentRange = response.headers.get('content-range');
-    if (contentRange) {
-      res.setHeader('Content-Range', contentRange);
-    }
-
-    const acceptRanges = response.headers.get('accept-ranges');
-    if (acceptRanges) {
-      res.setHeader('Accept-Ranges', acceptRanges);
-    }
-
+    // Simple Content-Type without codecs (more compatible)
+    res.setHeader('Content-Type', 'video/mp2t');
+    
+    // Dummy Content-Length for live stream (ExoPlayer expects this)
+    res.setHeader('Content-Length', '999999999999999');
+    
+    // No Accept-Ranges for live streams
+    res.setHeader('Accept-Ranges', 'none');
+    
     // Cache for 5 minutes
     res.setHeader('Cache-Control', 'public, max-age=300');
 
@@ -280,13 +258,62 @@ app.get('/stream/:token', async (req, res) => {
     res.setHeader('Access-Control-Allow-Headers', 'Range, User-Agent, Content-Type');
     res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Type, Accept-Ranges');
 
-    // Stream the response
-    response.body.pipe(res);
+    // Pre-buffer strategy: Buffer 64KB before streaming to prevent 0-byte reads
+    const PRE_BUFFER_SIZE = 65536; // 64KB
+    const chunks = [];
+    let bufferedSize = 0;
+    let streamStarted = false;
+
+    console.log(`[${new Date().toISOString()}] Pre-buffering ${PRE_BUFFER_SIZE} bytes before streaming`);
+
+    // Stream with async iteration (no direct pipe, no chunked encoding)
+    try {
+      for await (const chunk of response.body) {
+        if (!streamStarted) {
+          // Still pre-buffering
+          chunks.push(chunk);
+          bufferedSize += chunk.length;
+          
+          // Once we have enough buffered, start streaming
+          if (bufferedSize >= PRE_BUFFER_SIZE) {
+            console.log(`[${new Date().toISOString()}] Pre-buffer full (${bufferedSize} bytes), starting stream`);
+            
+            // Send all buffered data
+            for (const bufferedChunk of chunks) {
+              res.write(bufferedChunk);
+            }
+            
+            chunks.length = 0; // Clear buffer
+            streamStarted = true;
+          }
+        } else {
+          // Stream directly after pre-buffer
+          res.write(chunk);
+        }
+      }
+      
+      // If stream ended before pre-buffer was full, send what we have
+      if (!streamStarted && chunks.length > 0) {
+        console.log(`[${new Date().toISOString()}] Stream ended during pre-buffer, sending ${bufferedSize} bytes`);
+        for (const bufferedChunk of chunks) {
+          res.write(bufferedChunk);
+        }
+      }
+      
+      res.end();
+      console.log(`[${new Date().toISOString()}] Stream ended successfully`);
+      
+    } catch (streamError) {
+      console.error(`[${new Date().toISOString()}] Stream error:`, streamError.message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Streaming error' });
+      }
+    }
 
   } catch (error) {
-    console.error(`[${new Date().toISOString()}] Stream error:`, error.message);
+    console.error(`[${new Date().toISOString()}] Stream handler error:`, error.message);
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Streaming error' });
+      res.status(500).json({ error: 'Internal error' });
     }
   }
 });

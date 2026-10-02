@@ -231,7 +231,7 @@ class StreamManager {
   async fetchLoop() {
     while (this.isRunning) {
       try {
-        console.log(`[${new Date().toISOString()}] StreamManager: Connecting to portal...`);
+        console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Connecting to portal...`);
         
         const response = await fetch(this.streamUrl, {
           headers: {
@@ -242,12 +242,12 @@ class StreamManager {
         });
         
         if (!response.ok) {
-          console.error(`[${new Date().toISOString()}] StreamManager: Portal error ${response.status}`);
+          console.error(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Portal error ${response.status}`);
           await new Promise(resolve => setTimeout(resolve, 2000));
           continue;
         }
         
-        console.log(`[${new Date().toISOString()}] StreamManager: Portal connected`);
+        console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Portal connected`);
         
         let packetBuffer = Buffer.alloc(0);
         
@@ -265,11 +265,17 @@ class StreamManager {
           }
         }
         
-        console.log(`[${new Date().toISOString()}] StreamManager: Portal disconnected, reconnecting...`);
+        // Check if stopped before attempting reconnect
+        if (!this.isRunning) {
+          console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Stopped`);
+          break;
+        }
+        
+        console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Portal disconnected, reconnecting...`);
         await new Promise(resolve => setTimeout(resolve, 100));
         
       } catch (error) {
-        console.error(`[${new Date().toISOString()}] StreamManager: Error:`, error.message);
+        console.error(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Error:`, error.message);
         if (this.isRunning) {
           await new Promise(resolve => setTimeout(resolve, 2000));
         }
@@ -296,12 +302,12 @@ class StreamManager {
           timestamp: Date.now()
         });
         
-        console.log(`[${new Date().toISOString()}] StreamManager: Segment ${this.currentSeqNum} complete (${this.currentSegmentPackets.length} packets, ${(segmentData.length/1024).toFixed(1)} KB)`);
+        console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Segment ${this.currentSeqNum} complete (${this.currentSegmentPackets.length} packets, ${(segmentData.length/1024).toFixed(1)} KB)`);
         
         // Keep only last N segments
         while (this.segments.length > this.maxSegments) {
           const removed = this.segments.shift();
-          console.log(`[${new Date().toISOString()}] StreamManager: Dropped segment ${removed.seqNum}`);
+          console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Dropped segment ${removed.seqNum}`);
         }
       }
       
@@ -337,7 +343,7 @@ class StreamManager {
   }
   
   stop() {
-    console.log(`[${new Date().toISOString()}] StreamManager: Stopping (total packets: ${this.totalPackets})`);
+    console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Stopping (total packets: ${this.totalPackets})`);
     this.isRunning = false;
   }
 }

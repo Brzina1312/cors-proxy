@@ -198,6 +198,165 @@ class MPEGTSNormalizer {
 }
 
 // ============================================
+// HLS Stream Manager (Segmented Live Streaming)
+// ============================================
+class StreamManager {
+  constructor(token, streamUrl) {
+    this.token = token;
+    this.streamUrl = streamUrl;
+    this.segments = []; // [{seqNum, data: Buffer, packetCount}]
+    this.currentSeqNum = 0;
+    this.currentSegmentPackets = [];
+    this.segmentDuration = 6; // seconds per segment
+    this.maxSegments = 5; // Keep 5 segments = 30 seconds buffer
+    this.normalizer = new MPEGTSNormalizer();
+    this.lastAccessTime = Date.now();
+    this.isRunning = false;
+    this.startTime = null;
+    this.totalPackets = 0;
+  }
+  
+  async startFetching() {
+    if (this.isRunning) return;
+    
+    this.isRunning = true;
+    this.startTime = Date.now();
+    
+    console.log(`[${new Date().toISOString()}] StreamManager: Starting fetch for token ${this.token.substring(0, 20)}...`);
+    
+    this.fetchLoop();
+  }
+  
+  async fetchLoop() {
+    while (this.isRunning) {
+      try {
+        console.log(`[${new Date().toISOString()}] StreamManager: Connecting to portal...`);
+        
+        const response = await fetch(this.streamUrl, {
+          headers: {
+            'User-Agent': 'StreamNexus-Proxy/1.0',
+            'Connection': 'keep-alive'
+          },
+          timeout: 30000
+        });
+        
+        if (!response.ok) {
+          console.error(`[${new Date().toISOString()}] StreamManager: Portal error ${response.status}`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          continue;
+        }
+        
+        console.log(`[${new Date().toISOString()}] StreamManager: Portal connected`);
+        
+        let packetBuffer = Buffer.alloc(0);
+        
+        for await (const chunk of response.body) {
+          if (!this.isRunning) break;
+          
+          packetBuffer = Buffer.concat([packetBuffer, chunk]);
+          
+          while (packetBuffer.length >= 188) {
+            const packet = packetBuffer.slice(0, 188);
+            packetBuffer = packetBuffer.slice(188);
+            
+            const normalizedPacket = this.normalizer.normalizePacket(packet);
+            this.addPacket(normalizedPacket);
+          }
+        }
+        
+        console.log(`[${new Date().toISOString()}] StreamManager: Portal disconnected, reconnecting...`);
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+      } catch (error) {
+        console.error(`[${new Date().toISOString()}] StreamManager: Error:`, error.message);
+        if (this.isRunning) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      }
+    }
+  }
+  
+  addPacket(packet) {
+    this.currentSegmentPackets.push(packet);
+    this.totalPackets++;
+    
+    // Calculate which segment we should be on based on elapsed time
+    const elapsed = (Date.now() - this.startTime) / 1000;
+    const expectedSeq = Math.floor(elapsed / this.segmentDuration);
+    
+    if (expectedSeq > this.currentSeqNum) {
+      // Finalize current segment
+      if (this.currentSegmentPackets.length > 0) {
+        const segmentData = Buffer.concat(this.currentSegmentPackets);
+        this.segments.push({
+          seqNum: this.currentSeqNum,
+          data: segmentData,
+          packetCount: this.currentSegmentPackets.length,
+          timestamp: Date.now()
+        });
+        
+        console.log(`[${new Date().toISOString()}] StreamManager: Segment ${this.currentSeqNum} complete (${this.currentSegmentPackets.length} packets, ${(segmentData.length/1024).toFixed(1)} KB)`);
+        
+        // Keep only last N segments
+        while (this.segments.length > this.maxSegments) {
+          const removed = this.segments.shift();
+          console.log(`[${new Date().toISOString()}] StreamManager: Dropped segment ${removed.seqNum}`);
+        }
+      }
+      
+      // Start new segment
+      this.currentSeqNum = expectedSeq;
+      this.currentSegmentPackets = [];
+    }
+  }
+  
+  getPlaylist(baseUrl, token) {
+    this.lastAccessTime = Date.now();
+    
+    const lines = [
+      '#EXTM3U',
+      '#EXT-X-VERSION:3',
+      '#EXT-X-TARGETDURATION:6',
+      `#EXT-X-MEDIA-SEQUENCE:${this.segments.length > 0 ? this.segments[0].seqNum : 0}`
+    ];
+    
+    // Add all available segments
+    for (const seg of this.segments) {
+      lines.push(`#EXTINF:${this.segmentDuration}.0,`);
+      lines.push(`${baseUrl}/stream/${token}/seg/${seg.seqNum}.ts`);
+    }
+    
+    return lines.join('\n');
+  }
+  
+  getSegment(seqNum) {
+    this.lastAccessTime = Date.now();
+    const segment = this.segments.find(s => s.seqNum === seqNum);
+    return segment ? segment.data : null;
+  }
+  
+  stop() {
+    console.log(`[${new Date().toISOString()}] StreamManager: Stopping (total packets: ${this.totalPackets})`);
+    this.isRunning = false;
+  }
+}
+
+// Global stream managers
+const streamManagers = new Map(); // token -> StreamManager
+
+// Cleanup inactive streams every 30 seconds
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, manager] of streamManagers.entries()) {
+    if (now - manager.lastAccessTime > 60000) { // 60 seconds inactive
+      console.log(`[${new Date().toISOString()}] Cleanup: Removing inactive stream ${token.substring(0, 20)}...`);
+      manager.stop();
+      streamManagers.delete(token);
+    }
+  }
+}, 30000);
+
+// ============================================
 // HLS Playlist Endpoint
 // ============================================
 app.get('/stream/:token.m3u8', async (req, res) => {
@@ -216,31 +375,94 @@ app.get('/stream/:token.m3u8', async (req, res) => {
       return res.status(403).json({ error: 'Invalid token' });
     }
 
-    if (payload.type !== 'stream') {
+    if (payload.type !== 'stream' || !payload.streamUrl) {
       return res.status(403).json({ error: 'Invalid token type' });
     }
 
-    console.log(`[${new Date().toISOString()}] HLS Playlist: userId=${payload.userId}, ch=${payload.channelId}`);
+    console.log(`[${new Date().toISOString()}] HLS Playlist request: userId=${payload.userId}, ch=${payload.channelId}`);
+
+    // Get or create StreamManager
+    let manager = streamManagers.get(token);
+    if (!manager) {
+      console.log(`[${new Date().toISOString()}] Creating new StreamManager for ch=${payload.channelId}`);
+      manager = new StreamManager(token, payload.streamUrl);
+      streamManagers.set(token, manager);
+      manager.startFetching(); // Start background fetching
+    }
 
     const baseUrl = req.protocol + '://' + req.get('host');
-    const playlist = `#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-TARGETDURATION:10
-#EXT-X-MEDIA-SEQUENCE:0
-#EXTINF:10.0,
-${baseUrl}/stream/${token}/live.ts`;
+    const playlist = manager.getPlaylist(baseUrl, token);
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     
     res.send(playlist);
-    console.log(`[${new Date().toISOString()}] HLS Playlist sent`);
+    console.log(`[${new Date().toISOString()}] HLS Playlist sent (${manager.segments.length} segments available)`);
 
   } catch (error) {
     console.error(`[${new Date().toISOString()}] HLS playlist error:`, error.message);
     if (!res.headersSent) {
       res.status(500).json({ error: 'Playlist error' });
+    }
+  }
+});
+
+// ============================================
+// HLS Segment Endpoint (Segmented Live Streaming)
+// ============================================
+app.get('/stream/:token/seg/:seqNum.ts', async (req, res) => {
+  try {
+    let { token, seqNum } = req.params;
+    seqNum = parseInt(seqNum);
+    
+    if (!token || isNaN(seqNum) || !JWT_SECRET) {
+      return res.status(400).json({ error: 'Missing parameters' });
+    }
+
+    let payload;
+    try {
+      payload = jwt.verify(token, JWT_SECRET);
+    } catch (jwtError) {
+      console.error(`[${new Date().toISOString()}] Invalid JWT for segment:`, jwtError.message);
+      return res.status(403).json({ error: 'Invalid token' });
+    }
+
+    if (payload.type !== 'stream') {
+      return res.status(403).json({ error: 'Invalid token type' });
+    }
+
+    console.log(`[${new Date().toISOString()}] Segment request: ch=${payload.channelId}, seq=${seqNum}`);
+
+    // Get StreamManager
+    const manager = streamManagers.get(token);
+    if (!manager) {
+      console.error(`[${new Date().toISOString()}] No StreamManager found for token`);
+      return res.status(404).json({ error: 'Stream not found' });
+    }
+
+    // Get segment data
+    const segmentData = manager.getSegment(seqNum);
+    if (!segmentData) {
+      console.warn(`[${new Date().toISOString()}] Segment ${seqNum} not available (may have been dropped)`);
+      return res.status(404).json({ error: 'Segment not available' });
+    }
+
+    console.log(`[${new Date().toISOString()}] Serving segment ${seqNum} (${(segmentData.length/1024).toFixed(1)} KB)`);
+
+    // Send segment
+    res.status(200);
+    res.setHeader('Content-Type', 'video/mp2t');
+    res.setHeader('Content-Length', segmentData.length);
+    res.setHeader('Accept-Ranges', 'none');
+    res.setHeader('Cache-Control', 'public, max-age=86400'); // Segments are immutable
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.send(segmentData);
+
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] Segment error:`, error.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Segment error' });
     }
   }
 });

@@ -263,47 +263,15 @@ app.get('/stream/:token', async (req, res) => {
     res.setHeader('Access-Control-Allow-Headers', 'Range, User-Agent, Content-Type');
     res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Type, Accept-Ranges');
 
-    // Pre-buffer strategy: Buffer 8KB before streaming to prevent 0-byte reads
-    // Reduced from 64KB to 8KB to fix slow startup (was causing 7-10 second delays)
-    const PRE_BUFFER_SIZE = 8192; // 8KB - enough to prevent 0-byte reads, fast startup
-    const chunks = [];
-    let bufferedSize = 0;
-    let streamStarted = false;
+    // NO pre-buffering - stream immediately as data arrives from portal
+    // Portal response time (495ms) + network latency is the real bottleneck
+    // Pre-buffering adds unnecessary delay - stream bytes immediately
+    console.log(`[${new Date().toISOString()}] Starting immediate streaming (no pre-buffer)`);
 
-    console.log(`[${new Date().toISOString()}] Pre-buffering ${PRE_BUFFER_SIZE} bytes before streaming`);
-
-    // Stream with async iteration (no direct pipe, no chunked encoding)
+    // Stream with async iteration - send bytes immediately as received
     try {
       for await (const chunk of response.body) {
-        if (!streamStarted) {
-          // Still pre-buffering
-          chunks.push(chunk);
-          bufferedSize += chunk.length;
-          
-          // Once we have enough buffered, start streaming
-          if (bufferedSize >= PRE_BUFFER_SIZE) {
-            console.log(`[${new Date().toISOString()}] Pre-buffer full (${bufferedSize} bytes), starting stream`);
-            
-            // Send all buffered data
-            for (const bufferedChunk of chunks) {
-              res.write(bufferedChunk);
-            }
-            
-            chunks.length = 0; // Clear buffer
-            streamStarted = true;
-          }
-        } else {
-          // Stream directly after pre-buffer
-          res.write(chunk);
-        }
-      }
-      
-      // If stream ended before pre-buffer was full, send what we have
-      if (!streamStarted && chunks.length > 0) {
-        console.log(`[${new Date().toISOString()}] Stream ended during pre-buffer, sending ${bufferedSize} bytes`);
-        for (const bufferedChunk of chunks) {
-          res.write(bufferedChunk);
-        }
+        res.write(chunk);
       }
       
       res.end();

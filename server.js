@@ -248,8 +248,8 @@ app.get('/stream/:token', async (req, res) => {
     // Simple Content-Type without codecs (more compatible)
     res.setHeader('Content-Type', 'video/mp2t');
     
-    // Dummy Content-Length for live stream (ExoPlayer expects this)
-    res.setHeader('Content-Length', '999999999999999');
+    // NO Content-Length for live streams (unknown length)
+    // Sending fake large value causes ExoPlayer to hang waiting for more data
     
     // No Accept-Ranges for live streams
     res.setHeader('Accept-Ranges', 'none');

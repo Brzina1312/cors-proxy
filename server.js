@@ -369,10 +369,10 @@ async function startBuffering(session, token) {
         if (shouldFinalize && currentSegmentPackets.length > 0) {
           const segmentData = Buffer.concat(currentSegmentPackets);
           
-          // Calculate actual duration in seconds
-          const actualDuration = ptsDuration !== null 
-            ? ptsDuration / 90000.0 
-            : 5.0; // fallback if no PTS
+          // Calculate actual duration in seconds and clamp to reasonable range
+          // Prevents PTS discontinuities from creating insane durations (e.g., 47721s)
+          const rawDuration = ptsDuration !== null ? ptsDuration / 90000.0 : 5.0;
+          const actualDuration = Math.min(10.0, Math.max(2.0, rawDuration));
           
           const segment = {
             seqNum: session.currentSeqNum++,

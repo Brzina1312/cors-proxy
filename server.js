@@ -329,10 +329,18 @@ app.get('/stream/:token/seg/:seqNum.ts', async (req, res) => {
     
     session.lastAccess = Date.now();
 
-    // Verify segment number is reasonable (allow some flexibility for parallel requests)
-    if (seqNum < session.currentSegment || seqNum > session.currentSegment + 5) {
-      console.warn(`[${new Date().toISOString()}] Invalid segment ${seqNum}, expected around ${session.currentSegment}`);
-      return res.status(404).json({ error: 'Segment out of range' });
+    // Allow ExoPlayer to jump to any segment (it typically starts at live edge, not segment 0)
+    // If segment is older than currentSegment, it's expired
+    if (seqNum < session.currentSegment - 10) {
+      console.warn(`[${new Date().toISOString()}] Segment ${seqNum} too old, current is ${session.currentSegment}`);
+      return res.status(404).json({ error: 'Segment expired' });
+    }
+
+    // If ExoPlayer jumps ahead (e.g., requests segment 26 when we're at 0), accept it
+    // This happens when player wants to start at "live edge"
+    if (seqNum > session.currentSegment) {
+      console.log(`[${new Date().toISOString()}] ExoPlayer jumping to segment ${seqNum} (was at ${session.currentSegment}), serving from live edge`);
+      session.currentSegment = seqNum;
     }
 
     // Check if segment already in progress

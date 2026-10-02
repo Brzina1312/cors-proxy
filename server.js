@@ -448,10 +448,14 @@ app.get('/stream/:token/seg/:seqNum.ts', async (req, res) => {
 
       console.log(`[${new Date().toISOString()}] Segment ${seqNum} sent: ${packetCount} packets, ${(segmentData.length/1024).toFixed(1)} KB`);
 
-      // Update session state
-      if (seqNum >= session.currentSegment) {
-        session.currentSegment = seqNum + 1;
-      }
+      // Don't advance currentSegment - keep stable window so ExoPlayer doesn't lose track
+      // Previously: advancing currentSegment caused playlist to show "expired" segments
+      // that ExoPlayer had buffered, causing infinite pause/buffering
+      // Now: keep segment window stable (e.g., always show 26-55 if started at 26)
+      
+      // if (seqNum >= session.currentSegment) {
+      //   session.currentSegment = seqNum + 1;
+      // }
 
     } catch (error) {
       console.error(`[${new Date().toISOString()}] Segment streaming error:`, error.message);

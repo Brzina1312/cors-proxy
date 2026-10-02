@@ -1,8 +1,10 @@
 const express = require('express');
 const fetch = require('node-fetch');
+const jwt = require('jsonwebtoken');
 const app = express();
 
 const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET;
 
 // Request queue to prevent portal rate limiting
 // Portal returns 429 if too many requests come too quickly
@@ -139,6 +141,111 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
+// Token-based streaming endpoint (ExoPlayer compatible)
+// No redirects, direct HTTPS streaming with JWT validation
+app.get('/stream/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    
+    if (!token) {
+      console.error(`[${new Date().toISOString()}] Missing token parameter`);
+      return res.status(400).json({ error: 'Missing token' });
+    }
+
+    if (!JWT_SECRET) {
+      console.error(`[${new Date().toISOString()}] JWT_SECRET not configured`);
+      return res.status(500).json({ error: 'Server configuration error' });
+    }
+
+    // Validate JWT token
+    let payload;
+    try {
+      payload = jwt.verify(token, JWT_SECRET);
+    } catch (jwtError) {
+      console.error(`[${new Date().toISOString()}] Invalid JWT token:`, jwtError.message);
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+
+    // Verify token type and required fields
+    if (payload.type !== 'stream' || !payload.streamUrl) {
+      console.error(`[${new Date().toISOString()}] Invalid token payload:`, {
+        type: payload.type,
+        hasStreamUrl: !!payload.streamUrl
+      });
+      return res.status(403).json({ error: 'Invalid token payload' });
+    }
+
+    const streamUrl = payload.streamUrl;
+
+    // Validate URL is from allowed domain
+    const allowedDomain = 'vpn.streamhut.xyz';
+    const parsedUrl = new URL(streamUrl);
+    if (parsedUrl.hostname !== allowedDomain) {
+      console.error(`[${new Date().toISOString()}] Domain not allowed: ${parsedUrl.hostname}`);
+      return res.status(403).json({ error: 'Domain not allowed' });
+    }
+
+    console.log(`[${new Date().toISOString()}] Streaming (token): userId=${payload.userId}, channelId=${payload.channelId}, url=${streamUrl.substring(0, 80)}...`);
+
+    // Queue the request to prevent rate limiting
+    const response = await queueRequest(streamUrl, {
+      'User-Agent': 'StreamNexus-Proxy/1.0',
+      ...(req.headers.range ? { 'Range': req.headers.range } : {})
+    });
+
+    if (!response.ok) {
+      console.error(`[${new Date().toISOString()}] Upstream error: ${response.status}`);
+      return res.status(response.status).json({ error: 'Upstream error' });
+    }
+
+    console.log(`[${new Date().toISOString()}] Stream success: ${response.status}, Content-Type: ${response.headers.get('content-type') || 'none'}`);
+
+    // Copy relevant headers
+    res.status(response.status);
+    
+    const contentType = response.headers.get('content-type');
+    if (contentType) {
+      res.setHeader('Content-Type', contentType);
+    } else {
+      res.setHeader('Content-Type', 'video/mp2t');
+    }
+
+    const contentLength = response.headers.get('content-length');
+    if (contentLength) {
+      res.setHeader('Content-Length', contentLength);
+    }
+
+    const contentRange = response.headers.get('content-range');
+    if (contentRange) {
+      res.setHeader('Content-Range', contentRange);
+    }
+
+    const acceptRanges = response.headers.get('accept-ranges');
+    if (acceptRanges) {
+      res.setHeader('Accept-Ranges', acceptRanges);
+    }
+
+    // Cache for 5 minutes
+    res.setHeader('Cache-Control', 'public, max-age=300');
+
+    // CORS headers (critical for ExoPlayer)
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Range, User-Agent, Content-Type');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Type, Accept-Ranges');
+
+    // Stream the response
+    response.body.pipe(res);
+
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] Stream error:`, error.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Streaming error' });
+    }
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`CORS proxy server running on port ${PORT}`);
+  console.log(`JWT_SECRET configured: ${!!JWT_SECRET}`);
 });

@@ -210,9 +210,16 @@ app.get('/stream/:token', async (req, res) => {
     
     const contentType = response.headers.get('content-type');
     if (contentType) {
-      res.setHeader('Content-Type', contentType);
+      // Add codecs parameter for ExoPlayer compatibility
+      if (contentType.includes('video/mp2t') || contentType.includes('video/MP2T')) {
+        // Most IPTV streams use H.264 High Profile + AAC-LC
+        res.setHeader('Content-Type', 'video/mp2t; codecs="avc1.640028, mp4a.40.2"');
+      } else {
+        res.setHeader('Content-Type', contentType);
+      }
     } else {
-      res.setHeader('Content-Type', 'video/mp2t');
+      // Default MPEG-TS with codecs
+      res.setHeader('Content-Type', 'video/mp2t; codecs="avc1.640028, mp4a.40.2"');
     }
 
     const contentLength = response.headers.get('content-length');

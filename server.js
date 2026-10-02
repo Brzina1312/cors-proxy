@@ -8,7 +8,7 @@ const JWT_SECRET = process.env.JWT_SECRET;
 
 // Rate limiting: Track requests per user to prevent portal 456 errors
 const userRequestTracker = new Map();
-const USER_REQUEST_LIMIT = 3; // Max 3 requests per user per 10 seconds
+const USER_REQUEST_LIMIT = 10; // Max 10 requests per user per 10 seconds (allows player switching)
 const USER_REQUEST_WINDOW = 10000; // 10 seconds
 
 // Request queue to prevent portal rate limiting

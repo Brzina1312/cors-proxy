@@ -207,8 +207,8 @@ class StreamManager {
     this.segments = []; // [{seqNum, data: Buffer, packetCount}]
     this.currentSeqNum = 0;
     this.currentSegmentPackets = [];
-    this.segmentDuration = 6; // seconds per segment
-    this.maxSegments = 8; // Keep 8 segments = 48 seconds buffer
+    this.segmentDuration = 2; // seconds per segment (shorter for faster cold start)
+    this.maxSegments = 15; // Keep 15 segments = 30 seconds buffer
     this.normalizer = new MPEGTSNormalizer();
     this.lastAccessTime = Date.now();
     this.isRunning = false;
@@ -327,7 +327,7 @@ class StreamManager {
     const lines = [
       '#EXTM3U',
       '#EXT-X-VERSION:3',
-      '#EXT-X-TARGETDURATION:6',
+      `#EXT-X-TARGETDURATION:${this.segmentDuration}`,
       `#EXT-X-MEDIA-SEQUENCE:${this.segments.length > 0 ? this.segments[0].seqNum : 0}`
     ];
     

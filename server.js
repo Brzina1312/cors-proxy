@@ -331,12 +331,7 @@ function cleanupSession(token, reason = 'cleanup') {
     unregisterActiveStream(session.userId, token);
   }
   
-  // Clear segments to free memory immediately
-  if (session.segments) {
-    session.segments = [];
-  }
-  
-  // Delete session
+  // Delete session (segments will be garbage collected)
   sessionNormalizers.delete(token);
 }
 
@@ -474,6 +469,13 @@ async function startBuffering(session, token) {
       // Reset reconnect counter on successful read
       reconnectAttempts = 0;
       
+      // Protection: Stop buffering if client disconnected (no requests for 10+ seconds)
+      if (Date.now() - session.lastAccess > 10000 && session.segments.length > 0) {
+        console.log(`[${new Date().toISOString()}] Buffering: Client inactive for 10s, stopping`);
+        cleanupSession(token, 'client disconnected');
+        break;
+      }
+      
       // Add to packet buffer
       packetBuffer = Buffer.concat([packetBuffer, chunk]);
       
@@ -540,13 +542,15 @@ async function startBuffering(session, token) {
         }
         
         // Protection: Check for broken channel (no segments created within timeout)
+        // Only applies to NEW sessions that are actively trying to buffer but failing
         if (session.segments.length === 0 && session.startTime && 
             Date.now() - session.startTime > STREAM_START_TIMEOUT) {
           console.error(`[${new Date().toISOString()}] Buffering: Stream failed to create segments within ${STREAM_START_TIMEOUT/1000}s, marking as broken`);
+          // Mark channel as broken BEFORE cleanup
           if (session.channelId) {
             markChannelBroken(session.channelId, 'timeout - no segments');
           }
-          // Immediately clean up to free memory and unregister stream
+          // Then cleanup
           cleanupSession(token, 'timeout - no segments');
           break;
         }

@@ -198,10 +198,11 @@ class MPEGTSNormalizer {
 }
 
 // ============================================
-// On-Demand Segment Streaming (Simple, No Buffering)
+// Per-Session Buffering (No Sharing Between Users)
 // ============================================
-// Session state: only stores normalizer for PTS continuity (not data)
-const sessionNormalizers = new Map(); // token -> {normalizer, lastAccess, streamUrl}
+// Each session maintains its own buffer of segments
+// Background worker continuously creates segments from portal stream
+const sessionNormalizers = new Map(); // token -> {normalizer, segments, isBuffering, ...}
 
 // Cleanup inactive sessions every 60 seconds
 setInterval(() => {
@@ -211,13 +212,140 @@ setInterval(() => {
   for (const [token, session] of sessionNormalizers.entries()) {
     if (now - session.lastAccess > INACTIVE_TIMEOUT) {
       console.log(`[${new Date().toISOString()}] Cleanup: Removing inactive session for token ${token.substring(0, 8)}...`);
+      
+      // Stop buffering worker
+      if (session.isBuffering) {
+        session.isBuffering = false;
+        console.log(`[${new Date().toISOString()}] Cleanup: Stopped buffering for session ${token.substring(0, 8)}`);
+      }
+      
+      // Close portal connection if open
+      if (session.portalResponse) {
+        try {
+          session.portalResponse.body.cancel();
+        } catch (e) {
+          // Ignore errors during cleanup
+        }
+      }
+      
       sessionNormalizers.delete(token);
     }
   }
 }, 60000);
 
 // ============================================
-// HLS Playlist Endpoint (On-Demand Segments)
+// Background Buffering Worker (Per-Session)
+// ============================================
+async function startBuffering(session, token) {
+  if (session.isBuffering) return;
+  
+  session.isBuffering = true;
+  console.log(`[${new Date().toISOString()}] Starting background buffering for session ${token.substring(0, 8)}...`);
+  
+  let packetBuffer = Buffer.alloc(0);
+  let currentSegmentPackets = [];
+  let reconnectAttempts = 0;
+  const MAX_RECONNECT_ATTEMPTS = 100;
+  
+  while (session.isBuffering && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+    try {
+      // Connect to portal if needed
+      if (!session.portalStream || !session.portalResponse) {
+        console.log(`[${new Date().toISOString()}] Buffering: Connecting to portal...`);
+        
+        const portalResponse = await fetch(session.streamUrl, {
+          headers: {
+            'User-Agent': 'StreamNexus-Proxy/1.0',
+            'Connection': 'keep-alive'
+          },
+          timeout: 30000
+        });
+        
+        if (!portalResponse.ok) {
+          console.error(`[${new Date().toISOString()}] Buffering: Portal error ${portalResponse.status}`);
+          reconnectAttempts++;
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          continue;
+        }
+        
+        session.portalResponse = portalResponse;
+        session.portalStream = portalResponse.body[Symbol.asyncIterator]();
+        console.log(`[${new Date().toISOString()}] Buffering: Portal connected`);
+      }
+      
+      // Read from portal
+      const { value: chunk, done } = await session.portalStream.next();
+      
+      if (done) {
+        console.log(`[${new Date().toISOString()}] Buffering: Portal disconnected, reconnecting...`);
+        session.portalStream = null;
+        session.portalResponse = null;
+        reconnectAttempts++;
+        await new Promise(resolve => setTimeout(resolve, 100));
+        continue;
+      }
+      
+      // Reset reconnect counter on successful read
+      reconnectAttempts = 0;
+      
+      // Add to packet buffer
+      packetBuffer = Buffer.concat([packetBuffer, chunk]);
+      
+      // Process complete packets
+      while (packetBuffer.length >= 188) {
+        const packet = packetBuffer.slice(0, 188);
+        packetBuffer = packetBuffer.slice(188);
+        
+        // Normalize PTS/DTS
+        const normalizedPacket = session.normalizer.normalizePacket(packet);
+        currentSegmentPackets.push(normalizedPacket);
+        
+        // When we have enough packets for a segment (6000 packets = ~5 seconds)
+        if (currentSegmentPackets.length >= 6000) {
+          const segmentData = Buffer.concat(currentSegmentPackets);
+          
+          const segment = {
+            seqNum: session.currentSeqNum++,
+            data: segmentData,
+            timestamp: Date.now(),
+            duration: 5.0 // ~5 seconds per segment
+          };
+          
+          session.segments.push(segment);
+          
+          const oldestSeq = session.segments[0].seqNum;
+          const newestSeq = segment.seqNum;
+          console.log(`[${new Date().toISOString()}] Buffering: Segment ${segment.seqNum} created (${(segmentData.length/1024).toFixed(1)} KB, buffer: ${session.segments.length} segments, range: ${oldestSeq}-${newestSeq})`);
+          
+          // Keep only last 30 segments (2.5 minutes of buffer)
+          if (session.segments.length > 30) {
+            const removed = session.segments.shift();
+            console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 30)`);
+          }
+          
+          // Reset for next segment
+          currentSegmentPackets = [];
+        }
+      }
+      
+    } catch (error) {
+      console.error(`[${new Date().toISOString()}] Buffering error:`, error.message);
+      session.portalStream = null;
+      session.portalResponse = null;
+      reconnectAttempts++;
+      
+      if (session.isBuffering) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    }
+  }
+  
+  console.log(`[${new Date().toISOString()}] Buffering stopped for session ${token.substring(0, 8)}`);
+  session.isBuffering = false;
+}
+
+// ============================================
+// HLS Playlist Endpoint (Buffered Segments)
 // ============================================
 app.get('/stream/:token.m3u8', async (req, res) => {
   try {
@@ -248,32 +376,52 @@ app.get('/stream/:token.m3u8', async (req, res) => {
         normalizer: new MPEGTSNormalizer(),
         lastAccess: Date.now(),
         streamUrl: payload.streamUrl,
-        currentSegment: 0,
-        portalConnection: null
+        segments: [], // Buffer of available segments
+        currentSeqNum: 0, // Next segment number to create
+        isBuffering: false,
+        portalStream: null,
+        portalResponse: null
       };
       sessionNormalizers.set(token, session);
       console.log(`[${new Date().toISOString()}] New session created for user ${payload.userId}`);
+      
+      // Start background buffering
+      startBuffering(session, token);
     } else {
       session.lastAccess = Date.now();
     }
 
-    // Generate playlist with 30 segments (5 sec each = 2.5 min buffer)
+    // Generate playlist from actually buffered segments
     const baseUrl = req.protocol + '://' + req.get('host');
-    const SEGMENT_DURATION = 5; // seconds (smaller for more reliable delivery)
-    const NUM_SEGMENTS = 30; // 2.5 minutes total buffer
+    const SEGMENT_DURATION = 5; // seconds
     
+    // Wait briefly for initial segments if buffer is empty
+    if (session.segments.length === 0) {
+      console.log(`[${new Date().toISOString()}] Waiting for initial segments...`);
+      // Wait up to 3 seconds for first segments
+      for (let i = 0; i < 30; i++) {
+        if (session.segments.length >= 3) break;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    
+    if (session.segments.length === 0) {
+      console.warn(`[${new Date().toISOString()}] No segments available yet`);
+      return res.status(503).json({ error: 'Buffering in progress, try again' });
+    }
+    
+    const oldestSegment = session.segments[0].seqNum;
     const lines = [
       '#EXTM3U',
       '#EXT-X-VERSION:3',
       `#EXT-X-TARGETDURATION:${SEGMENT_DURATION + 1}`,
-      `#EXT-X-MEDIA-SEQUENCE:${session.currentSegment}`
+      `#EXT-X-MEDIA-SEQUENCE:${oldestSegment}`
     ];
     
-    // Add segments
-    for (let i = 0; i < NUM_SEGMENTS; i++) {
-      const segNum = session.currentSegment + i;
-      lines.push(`#EXTINF:${SEGMENT_DURATION.toFixed(3)},`);
-      lines.push(`${baseUrl}/stream/${token}/seg/${segNum}.ts`);
+    // Add all buffered segments
+    for (const seg of session.segments) {
+      lines.push(`#EXTINF:${seg.duration.toFixed(3)},`);
+      lines.push(`${baseUrl}/stream/${token}/seg/${seg.seqNum}.ts`);
     }
     
     const playlist = lines.join('\n');
@@ -283,7 +431,9 @@ app.get('/stream/:token.m3u8', async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     
     res.send(playlist);
-    console.log(`[${new Date().toISOString()}] HLS Playlist sent: segments ${session.currentSegment}-${session.currentSegment + NUM_SEGMENTS - 1}`);
+    
+    const newestSegment = session.segments[session.segments.length - 1].seqNum;
+    console.log(`[${new Date().toISOString()}] HLS Playlist sent: ${session.segments.length} segments (${oldestSegment}-${newestSegment})`);;
 
   } catch (error) {
     console.error(`[${new Date().toISOString()}] HLS playlist error:`, error.message);
@@ -294,7 +444,7 @@ app.get('/stream/:token.m3u8', async (req, res) => {
 });
 
 // ============================================
-// On-Demand Segment Endpoint
+// Buffered Segment Endpoint
 // ============================================
 app.get('/stream/:token/seg/:seqNum.ts', async (req, res) => {
   try {
@@ -318,157 +468,36 @@ app.get('/stream/:token/seg/:seqNum.ts', async (req, res) => {
       return res.status(403).json({ error: 'Invalid token type' });
     }
 
-    console.log(`[${new Date().toISOString()}] Segment ${seqNum} request: userId=${payload.userId}, ch=${payload.channelId}`);
-
     // Get session
     const session = sessionNormalizers.get(token);
     if (!session) {
-      console.error(`[${new Date().toISOString()}] No session found for token`);
+      console.error(`[${new Date().toISOString()}] No session found for segment ${seqNum}`);
       return res.status(404).json({ error: 'Session not found' });
     }
     
     session.lastAccess = Date.now();
 
-    // Allow ExoPlayer to jump to any segment (it typically starts at live edge, not segment 0)
-    // If segment is older than currentSegment, it's expired
-    if (seqNum < session.currentSegment - 10) {
-      console.warn(`[${new Date().toISOString()}] Segment ${seqNum} too old, current is ${session.currentSegment}`);
-      return res.status(404).json({ error: 'Segment expired' });
+    // Find segment in buffer
+    const segment = session.segments.find(s => s.seqNum === seqNum);
+    
+    if (!segment) {
+      const available = session.segments.length > 0 
+        ? `${session.segments[0].seqNum}-${session.segments[session.segments.length - 1].seqNum}`
+        : 'none';
+      console.warn(`[${new Date().toISOString()}] Segment ${seqNum} not found (available: ${available})`);
+      return res.status(404).json({ error: 'Segment not available' });
     }
 
-    // If ExoPlayer jumps ahead (e.g., requests segment 26 when we're at 0), accept it
-    // This happens when player wants to start at "live edge"
-    if (seqNum > session.currentSegment) {
-      console.log(`[${new Date().toISOString()}] ExoPlayer jumping to segment ${seqNum} (was at ${session.currentSegment}), serving from live edge`);
-      session.currentSegment = seqNum;
-    }
-
-    // Check if segment already in progress
-    if (session.segmentInProgress) {
-      console.warn(`[${new Date().toISOString()}] Segment already in progress, rejecting ${seqNum}`);
-      return res.status(429).json({ error: 'Segment in progress' });
-    }
-
-    session.segmentInProgress = true;
-
-    try {
-      // Connect to portal if not already connected
-      if (!session.portalStream || !session.portalResponse) {
-        console.log(`[${new Date().toISOString()}] Connecting to portal for segment ${seqNum}...`);
-        
-        const portalResponse = await fetch(session.streamUrl, {
-          headers: {
-            'User-Agent': 'StreamNexus-Proxy/1.0',
-            'Connection': 'keep-alive'
-          },
-          timeout: 30000
-        });
-
-        if (!portalResponse.ok) {
-          console.error(`[${new Date().toISOString()}] Portal error: ${portalResponse.status}`);
-          session.segmentInProgress = false;
-          return res.status(502).json({ error: 'Portal connection failed' });
-        }
-
-        session.portalResponse = portalResponse;
-        session.portalStream = portalResponse.body[Symbol.asyncIterator]();
-        session.rawPacketBuffer = Buffer.alloc(0);
-        
-        console.log(`[${new Date().toISOString()}] Portal connected for segment ${seqNum}`);
-      }
-
-      // Stream packets for this segment (smaller segments for more reliability)
-      const PACKETS_PER_SEGMENT = 6000; // ~4-5 seconds at 1.5 Mbps
-      const segmentPackets = [];
-      let packetCount = 0;
-
-      res.status(200);
-      res.setHeader('Content-Type', 'video/mp2t');
-      res.setHeader('Accept-Ranges', 'none');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Access-Control-Allow-Origin', '*');
-
-      // Read packets from portal stream with reconnection on mid-segment disconnect
-      const MAX_RECONNECTS_PER_SEGMENT = 3;
-      let reconnectAttempts = 0;
-
-      while (packetCount < PACKETS_PER_SEGMENT && reconnectAttempts < MAX_RECONNECTS_PER_SEGMENT) {
-        const { value: chunk, done } = await session.portalStream.next();
-        
-        if (done) {
-          console.log(`[${new Date().toISOString()}] Portal disconnected mid-segment (${packetCount}/${PACKETS_PER_SEGMENT} packets), reconnecting...`);
-          
-          // Clear connection
-          session.portalStream = null;
-          session.portalResponse = null;
-          reconnectAttempts++;
-          
-          // Try to reconnect and continue filling segment
-          try {
-            const portalResponse = await fetch(session.streamUrl, {
-              headers: {
-                'User-Agent': 'StreamNexus-Proxy/1.0',
-                'Connection': 'keep-alive'
-              },
-              timeout: 30000
-            });
-            
-            if (portalResponse.ok) {
-              session.portalResponse = portalResponse;
-              session.portalStream = portalResponse.body[Symbol.asyncIterator]();
-              console.log(`[${new Date().toISOString()}] Portal reconnected for segment ${seqNum}, continuing (attempt ${reconnectAttempts}, ${packetCount}/${PACKETS_PER_SEGMENT} packets)`);
-              continue; // Continue while loop to read more packets
-            } else {
-              console.error(`[${new Date().toISOString()}] Reconnection failed: ${portalResponse.status}`);
-              break;
-            }
-          } catch (reconnectError) {
-            console.error(`[${new Date().toISOString()}] Reconnection error: ${reconnectError.message}`);
-            break;
-          }
-        }
-
-        session.rawPacketBuffer = Buffer.concat([session.rawPacketBuffer, chunk]);
-
-        // Process complete packets
-        while (session.rawPacketBuffer.length >= 188 && packetCount < PACKETS_PER_SEGMENT) {
-          const packet = session.rawPacketBuffer.slice(0, 188);
-          session.rawPacketBuffer = session.rawPacketBuffer.slice(188);
-
-          // Normalize PTS/DTS
-          const normalizedPacket = session.normalizer.normalizePacket(packet);
-          segmentPackets.push(normalizedPacket);
-          packetCount++;
-        }
-      }
-
-      // Send segment data
-      const segmentData = Buffer.concat(segmentPackets);
-      res.send(segmentData);
-
-      console.log(`[${new Date().toISOString()}] Segment ${seqNum} sent: ${packetCount} packets, ${(segmentData.length/1024).toFixed(1)} KB`);
-
-      // Don't advance currentSegment - keep stable window so ExoPlayer doesn't lose track
-      // Previously: advancing currentSegment caused playlist to show "expired" segments
-      // that ExoPlayer had buffered, causing infinite pause/buffering
-      // Now: keep segment window stable (e.g., always show 26-55 if started at 26)
-      
-      // if (seqNum >= session.currentSegment) {
-      //   session.currentSegment = seqNum + 1;
-      // }
-
-    } catch (error) {
-      console.error(`[${new Date().toISOString()}] Segment streaming error:`, error.message);
-      // Clean up connection on error
-      session.portalStream = null;
-      session.portalResponse = null;
-      
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Segment streaming failed' });
-      }
-    } finally {
-      session.segmentInProgress = false;
-    }
+    // Serve buffered segment
+    console.log(`[${new Date().toISOString()}] Serving segment ${seqNum} from buffer (${(segment.data.length/1024).toFixed(1)} KB)`);
+    
+    res.status(200);
+    res.setHeader('Content-Type', 'video/mp2t');
+    res.setHeader('Content-Length', segment.data.length);
+    res.setHeader('Accept-Ranges', 'none');
+    res.setHeader('Cache-Control', 'public, max-age=86400'); // Segments are immutable
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.send(segment.data);
 
   } catch (error) {
     console.error(`[${new Date().toISOString()}] Segment handler error:`, error.message);

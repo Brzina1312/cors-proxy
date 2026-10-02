@@ -263,8 +263,9 @@ app.get('/stream/:token', async (req, res) => {
     res.setHeader('Access-Control-Allow-Headers', 'Range, User-Agent, Content-Type');
     res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Content-Type, Accept-Ranges');
 
-    // Pre-buffer strategy: Buffer 64KB before streaming to prevent 0-byte reads
-    const PRE_BUFFER_SIZE = 65536; // 64KB
+    // Pre-buffer strategy: Buffer 8KB before streaming to prevent 0-byte reads
+    // Reduced from 64KB to 8KB to fix slow startup (was causing 7-10 second delays)
+    const PRE_BUFFER_SIZE = 8192; // 8KB - enough to prevent 0-byte reads, fast startup
     const chunks = [];
     let bufferedSize = 0;
     let streamStarted = false;

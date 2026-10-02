@@ -317,10 +317,11 @@ async function startBuffering(session, token) {
           const newestSeq = segment.seqNum;
           console.log(`[${new Date().toISOString()}] Buffering: Segment ${segment.seqNum} created (${(segmentData.length/1024).toFixed(1)} KB, buffer: ${session.segments.length} segments, range: ${oldestSeq}-${newestSeq})`);
           
-          // Keep only last 30 segments (2.5 minutes of buffer)
-          if (session.segments.length > 30) {
+          // Keep only last 90 segments (7.5 minutes of buffer)
+          // Larger buffer prevents dropping segments before ExoPlayer can catch up
+          if (session.segments.length > 90) {
             const removed = session.segments.shift();
-            console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 30)`);
+            console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 90)`);
           }
           
           // Reset for next segment

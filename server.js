@@ -198,12 +198,26 @@ class MPEGTSNormalizer {
 }
 
 // ============================================
-// Simple HLS Streaming (No Shared State)
+// On-Demand Segment Streaming (Simple, No Buffering)
 // ============================================
-// StreamManager removed - each request gets independent stream
+// Session state: only stores normalizer for PTS continuity (not data)
+const sessionNormalizers = new Map(); // token -> {normalizer, lastAccess, streamUrl}
+
+// Cleanup inactive sessions every 60 seconds
+setInterval(() => {
+  const now = Date.now();
+  const INACTIVE_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+  
+  for (const [token, session] of sessionNormalizers.entries()) {
+    if (now - session.lastAccess > INACTIVE_TIMEOUT) {
+      console.log(`[${new Date().toISOString()}] Cleanup: Removing inactive session for token ${token.substring(0, 8)}...`);
+      sessionNormalizers.delete(token);
+    }
+  }
+}, 60000);
 
 // ============================================
-// HLS Playlist Endpoint (Simplified - No StreamManager)
+// HLS Playlist Endpoint (On-Demand Segments)
 // ============================================
 app.get('/stream/:token.m3u8', async (req, res) => {
   try {
@@ -227,28 +241,199 @@ app.get('/stream/:token.m3u8', async (req, res) => {
 
     console.log(`[${new Date().toISOString()}] HLS Playlist request: userId=${payload.userId}, ch=${payload.channelId}`);
 
-    // Simple static playlist pointing to continuous live.ts stream
+    // Get or create session for this token
+    let session = sessionNormalizers.get(token);
+    if (!session) {
+      session = {
+        normalizer: new MPEGTSNormalizer(),
+        lastAccess: Date.now(),
+        streamUrl: payload.streamUrl,
+        currentSegment: 0,
+        portalConnection: null
+      };
+      sessionNormalizers.set(token, session);
+      console.log(`[${new Date().toISOString()}] New session created for user ${payload.userId}`);
+    } else {
+      session.lastAccess = Date.now();
+    }
+
+    // Generate playlist with 30 segments (10 sec each = 5 min buffer)
     const baseUrl = req.protocol + '://' + req.get('host');
-    const playlist = [
+    const SEGMENT_DURATION = 10; // seconds
+    const NUM_SEGMENTS = 30; // 5 minutes total buffer
+    
+    const lines = [
       '#EXTM3U',
       '#EXT-X-VERSION:3',
-      '#EXT-X-TARGETDURATION:3600',
-      '#EXT-X-MEDIA-SEQUENCE:0',
-      '#EXTINF:3600.000,',
-      `${baseUrl}/stream/${token}/live.ts`
-    ].join('\n');
+      `#EXT-X-TARGETDURATION:${SEGMENT_DURATION + 1}`,
+      `#EXT-X-MEDIA-SEQUENCE:${session.currentSegment}`
+    ];
+    
+    // Add segments
+    for (let i = 0; i < NUM_SEGMENTS; i++) {
+      const segNum = session.currentSegment + i;
+      lines.push(`#EXTINF:${SEGMENT_DURATION.toFixed(3)},`);
+      lines.push(`${baseUrl}/stream/${token}/seg/${segNum}.ts`);
+    }
+    
+    const playlist = lines.join('\n');
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     
     res.send(playlist);
-    console.log(`[${new Date().toISOString()}] HLS Playlist sent (simple continuous stream)`);
+    console.log(`[${new Date().toISOString()}] HLS Playlist sent: segments ${session.currentSegment}-${session.currentSegment + NUM_SEGMENTS - 1}`);
 
   } catch (error) {
     console.error(`[${new Date().toISOString()}] HLS playlist error:`, error.message);
     if (!res.headersSent) {
       res.status(500).json({ error: 'Playlist error' });
+    }
+  }
+});
+
+// ============================================
+// On-Demand Segment Endpoint
+// ============================================
+app.get('/stream/:token/seg/:seqNum.ts', async (req, res) => {
+  try {
+    let { token, seqNum } = req.params;
+    seqNum = parseInt(seqNum);
+    
+    if (!token || isNaN(seqNum) || !JWT_SECRET) {
+      return res.status(400).json({ error: 'Missing parameters' });
+    }
+
+    // Validate JWT
+    let payload;
+    try {
+      payload = jwt.verify(token, JWT_SECRET);
+    } catch (jwtError) {
+      console.error(`[${new Date().toISOString()}] Invalid JWT for segment:`, jwtError.message);
+      return res.status(403).json({ error: 'Invalid token' });
+    }
+
+    if (payload.type !== 'stream' || !payload.streamUrl) {
+      return res.status(403).json({ error: 'Invalid token type' });
+    }
+
+    console.log(`[${new Date().toISOString()}] Segment ${seqNum} request: userId=${payload.userId}, ch=${payload.channelId}`);
+
+    // Get session
+    const session = sessionNormalizers.get(token);
+    if (!session) {
+      console.error(`[${new Date().toISOString()}] No session found for token`);
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    
+    session.lastAccess = Date.now();
+
+    // Verify segment number is reasonable (allow some flexibility for parallel requests)
+    if (seqNum < session.currentSegment || seqNum > session.currentSegment + 5) {
+      console.warn(`[${new Date().toISOString()}] Invalid segment ${seqNum}, expected around ${session.currentSegment}`);
+      return res.status(404).json({ error: 'Segment out of range' });
+    }
+
+    // Check if segment already in progress
+    if (session.segmentInProgress) {
+      console.warn(`[${new Date().toISOString()}] Segment already in progress, rejecting ${seqNum}`);
+      return res.status(429).json({ error: 'Segment in progress' });
+    }
+
+    session.segmentInProgress = true;
+
+    try {
+      // Connect to portal if not already connected
+      if (!session.portalStream || !session.portalResponse) {
+        console.log(`[${new Date().toISOString()}] Connecting to portal for segment ${seqNum}...`);
+        
+        const portalResponse = await fetch(session.streamUrl, {
+          headers: {
+            'User-Agent': 'StreamNexus-Proxy/1.0',
+            'Connection': 'keep-alive'
+          },
+          timeout: 30000
+        });
+
+        if (!portalResponse.ok) {
+          console.error(`[${new Date().toISOString()}] Portal error: ${portalResponse.status}`);
+          session.segmentInProgress = false;
+          return res.status(502).json({ error: 'Portal connection failed' });
+        }
+
+        session.portalResponse = portalResponse;
+        session.portalStream = portalResponse.body[Symbol.asyncIterator]();
+        session.rawPacketBuffer = Buffer.alloc(0);
+        
+        console.log(`[${new Date().toISOString()}] Portal connected for segment ${seqNum}`);
+      }
+
+      // Stream packets for this segment
+      const PACKETS_PER_SEGMENT = 15000; // ~10 seconds at higher bitrate = bigger buffer
+      const segmentPackets = [];
+      let packetCount = 0;
+
+      res.status(200);
+      res.setHeader('Content-Type', 'video/mp2t');
+      res.setHeader('Accept-Ranges', 'none');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+
+      // Read packets from portal stream
+      while (packetCount < PACKETS_PER_SEGMENT) {
+        const { value: chunk, done } = await session.portalStream.next();
+        
+        if (done) {
+          console.log(`[${new Date().toISOString()}] Portal stream ended, reconnecting...`);
+          // Reconnect
+          session.portalStream = null;
+          session.portalResponse = null;
+          break;
+        }
+
+        session.rawPacketBuffer = Buffer.concat([session.rawPacketBuffer, chunk]);
+
+        // Process complete packets
+        while (session.rawPacketBuffer.length >= 188 && packetCount < PACKETS_PER_SEGMENT) {
+          const packet = session.rawPacketBuffer.slice(0, 188);
+          session.rawPacketBuffer = session.rawPacketBuffer.slice(188);
+
+          // Normalize PTS/DTS
+          const normalizedPacket = session.normalizer.normalizePacket(packet);
+          segmentPackets.push(normalizedPacket);
+          packetCount++;
+        }
+      }
+
+      // Send segment data
+      const segmentData = Buffer.concat(segmentPackets);
+      res.send(segmentData);
+
+      console.log(`[${new Date().toISOString()}] Segment ${seqNum} sent: ${packetCount} packets, ${(segmentData.length/1024).toFixed(1)} KB`);
+
+      // Update session state
+      if (seqNum >= session.currentSegment) {
+        session.currentSegment = seqNum + 1;
+      }
+
+    } catch (error) {
+      console.error(`[${new Date().toISOString()}] Segment streaming error:`, error.message);
+      // Clean up connection on error
+      session.portalStream = null;
+      session.portalResponse = null;
+      
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Segment streaming failed' });
+      }
+    } finally {
+      session.segmentInProgress = false;
+    }
+
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] Segment handler error:`, error.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Internal error' });
     }
   }
 });

@@ -6,6 +6,11 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
 
+// Rate limiting: Track requests per user to prevent portal 456 errors
+const userRequestTracker = new Map();
+const USER_REQUEST_LIMIT = 3; // Max 3 requests per user per 10 seconds
+const USER_REQUEST_WINDOW = 10000; // 10 seconds
+
 // Request queue to prevent portal rate limiting
 // Portal returns 429 if too many requests come too quickly
 const requestQueue = [];
@@ -179,6 +184,35 @@ app.get('/stream/:token', async (req, res) => {
       });
       return res.status(403).json({ error: 'Invalid token payload' });
     }
+
+    // Rate limiting: Prevent portal 456 errors (Load Limit Reached)
+    // Portal blocks MAC if too many requests come too fast
+    const userId = payload.userId;
+    const now = Date.now();
+    
+    if (!userRequestTracker.has(userId)) {
+      userRequestTracker.set(userId, []);
+    }
+    
+    const userRequests = userRequestTracker.get(userId);
+    // Remove requests older than window
+    const recentRequests = userRequests.filter(time => now - time < USER_REQUEST_WINDOW);
+    
+    if (recentRequests.length >= USER_REQUEST_LIMIT) {
+      const oldestRequest = Math.min(...recentRequests);
+      const waitTime = Math.ceil((USER_REQUEST_WINDOW - (now - oldestRequest)) / 1000);
+      
+      console.warn(`[${new Date().toISOString()}] Rate limit exceeded for user ${userId}: ${recentRequests.length} requests in ${USER_REQUEST_WINDOW}ms`);
+      
+      return res.status(429).json({ 
+        error: 'Too many requests. Please wait before trying again.',
+        retryAfter: waitTime
+      });
+    }
+    
+    // Add current request
+    recentRequests.push(now);
+    userRequestTracker.set(userId, recentRequests);
 
     const streamUrl = payload.streamUrl;
 

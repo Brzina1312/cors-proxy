@@ -207,6 +207,7 @@ class StreamManager {
     this.segments = []; // [{seqNum, data: Buffer, packetCount}]
     this.currentSeqNum = 0;
     this.currentSegmentPackets = [];
+    this.currentSegmentSize = 0; // Track segment size incrementally
     this.segmentDuration = 2; // seconds per segment (shorter for faster cold start)
     this.maxSegments = 15; // Keep 15 segments = 30 seconds buffer
     this.normalizer = new MPEGTSNormalizer();
@@ -289,16 +290,26 @@ class StreamManager {
     }
     
     this.currentSegmentPackets.push(packet);
+    this.currentSegmentSize += packet.length; // Track size incrementally
     this.totalPackets++;
     
     // Calculate which segment we should be on based on elapsed time
     const elapsed = (Date.now() - this.startTime) / 1000;
     const expectedSeq = Math.floor(elapsed / this.segmentDuration);
     
-    if (expectedSeq > this.currentSeqNum) {
+    // Size limit: 5 MB per segment to prevent memory issues and decoder overload
+    const MAX_SEGMENT_SIZE = 5 * 1024 * 1024; // 5 MB
+    const sizeExceeded = this.currentSegmentSize >= MAX_SEGMENT_SIZE;
+    const timeElapsed = expectedSeq > this.currentSeqNum;
+    
+    // Finalize segment if time elapsed OR size limit reached
+    if (timeElapsed || sizeExceeded) {
       // Finalize current segment
       if (this.currentSegmentPackets.length > 0) {
         const segmentData = Buffer.concat(this.currentSegmentPackets);
+        const actualDuration = elapsed - (this.currentSeqNum * this.segmentDuration);
+        const bitrateMbps = (segmentData.length * 8 / actualDuration / 1000000).toFixed(2);
+        
         this.segments.push({
           seqNum: this.currentSeqNum,
           data: segmentData,
@@ -306,7 +317,7 @@ class StreamManager {
           timestamp: Date.now()
         });
         
-        console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Segment ${this.currentSeqNum} complete (${this.currentSegmentPackets.length} packets, ${(segmentData.length/1024).toFixed(1)} KB)`);
+        console.log(`[${new Date().toISOString()}] StreamManager (ch=${this.channelId}): Segment ${this.currentSeqNum} complete (${this.currentSegmentPackets.length} packets, ${(segmentData.length/1024).toFixed(1)} KB, ${actualDuration.toFixed(2)}s, ${bitrateMbps} Mbps)${sizeExceeded ? ' [SIZE LIMIT]' : ''}`);
         
         // Keep only last N segments
         while (this.segments.length > this.maxSegments) {
@@ -316,8 +327,9 @@ class StreamManager {
       }
       
       // Start new segment
-      this.currentSeqNum = expectedSeq;
+      this.currentSeqNum++;
       this.currentSegmentPackets = [];
+      this.currentSegmentSize = 0; // Reset size counter
     }
   }
   

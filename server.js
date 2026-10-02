@@ -257,10 +257,10 @@ app.get('/stream/:token.m3u8', async (req, res) => {
       session.lastAccess = Date.now();
     }
 
-    // Generate playlist with 30 segments (10 sec each = 5 min buffer)
+    // Generate playlist with 30 segments (5 sec each = 2.5 min buffer)
     const baseUrl = req.protocol + '://' + req.get('host');
-    const SEGMENT_DURATION = 10; // seconds
-    const NUM_SEGMENTS = 30; // 5 minutes total buffer
+    const SEGMENT_DURATION = 5; // seconds (smaller for more reliable delivery)
+    const NUM_SEGMENTS = 30; // 2.5 minutes total buffer
     
     const lines = [
       '#EXTM3U',
@@ -377,8 +377,8 @@ app.get('/stream/:token/seg/:seqNum.ts', async (req, res) => {
         console.log(`[${new Date().toISOString()}] Portal connected for segment ${seqNum}`);
       }
 
-      // Stream packets for this segment
-      const PACKETS_PER_SEGMENT = 15000; // ~10 seconds at higher bitrate = bigger buffer
+      // Stream packets for this segment (smaller segments for more reliability)
+      const PACKETS_PER_SEGMENT = 6000; // ~4-5 seconds at 1.5 Mbps
       const segmentPackets = [];
       let packetCount = 0;
 
@@ -388,16 +388,44 @@ app.get('/stream/:token/seg/:seqNum.ts', async (req, res) => {
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Access-Control-Allow-Origin', '*');
 
-      // Read packets from portal stream
-      while (packetCount < PACKETS_PER_SEGMENT) {
+      // Read packets from portal stream with reconnection on mid-segment disconnect
+      const MAX_RECONNECTS_PER_SEGMENT = 3;
+      let reconnectAttempts = 0;
+
+      while (packetCount < PACKETS_PER_SEGMENT && reconnectAttempts < MAX_RECONNECTS_PER_SEGMENT) {
         const { value: chunk, done } = await session.portalStream.next();
         
         if (done) {
-          console.log(`[${new Date().toISOString()}] Portal stream ended, reconnecting...`);
-          // Reconnect
+          console.log(`[${new Date().toISOString()}] Portal disconnected mid-segment (${packetCount}/${PACKETS_PER_SEGMENT} packets), reconnecting...`);
+          
+          // Clear connection
           session.portalStream = null;
           session.portalResponse = null;
-          break;
+          reconnectAttempts++;
+          
+          // Try to reconnect and continue filling segment
+          try {
+            const portalResponse = await fetch(session.streamUrl, {
+              headers: {
+                'User-Agent': 'StreamNexus-Proxy/1.0',
+                'Connection': 'keep-alive'
+              },
+              timeout: 30000
+            });
+            
+            if (portalResponse.ok) {
+              session.portalResponse = portalResponse;
+              session.portalStream = portalResponse.body[Symbol.asyncIterator]();
+              console.log(`[${new Date().toISOString()}] Portal reconnected for segment ${seqNum}, continuing (attempt ${reconnectAttempts}, ${packetCount}/${PACKETS_PER_SEGMENT} packets)`);
+              continue; // Continue while loop to read more packets
+            } else {
+              console.error(`[${new Date().toISOString()}] Reconnection failed: ${portalResponse.status}`);
+              break;
+            }
+          } catch (reconnectError) {
+            console.error(`[${new Date().toISOString()}] Reconnection error: ${reconnectError.message}`);
+            break;
+          }
         }
 
         session.rawPacketBuffer = Buffer.concat([session.rawPacketBuffer, chunk]);

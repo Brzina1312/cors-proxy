@@ -208,8 +208,9 @@ class StreamManager {
     this.currentSeqNum = 0;
     this.currentSegmentPackets = [];
     this.currentSegmentSize = 0; // Track segment size incrementally
+    this.currentSegmentStartTime = null; // Track when current segment started
     this.segmentDuration = 2; // seconds per segment (shorter for faster cold start)
-    this.maxSegments = 15; // Keep 15 segments = 30 seconds buffer
+    this.maxSegments = 30; // Keep 30 segments = 60 seconds buffer
     this.normalizer = new MPEGTSNormalizer();
     this.lastAccessTime = Date.now();
     this.isRunning = false;
@@ -287,27 +288,27 @@ class StreamManager {
     // Set startTime on first packet arrival (fixes cold start timing bug)
     if (!this.startTime) {
       this.startTime = Date.now();
+      this.currentSegmentStartTime = Date.now(); // Initialize segment timer
     }
     
     this.currentSegmentPackets.push(packet);
     this.currentSegmentSize += packet.length; // Track size incrementally
     this.totalPackets++;
     
-    // Calculate which segment we should be on based on elapsed time
-    const elapsed = (Date.now() - this.startTime) / 1000;
-    const expectedSeq = Math.floor(elapsed / this.segmentDuration);
+    // Calculate elapsed time for CURRENT segment (not global time)
+    const segmentElapsed = (Date.now() - this.currentSegmentStartTime) / 1000;
     
     // Size limit: 5 MB per segment to prevent memory issues and decoder overload
     const MAX_SEGMENT_SIZE = 5 * 1024 * 1024; // 5 MB
     const sizeExceeded = this.currentSegmentSize >= MAX_SEGMENT_SIZE;
-    const timeElapsed = expectedSeq > this.currentSeqNum;
+    const timeElapsed = segmentElapsed >= this.segmentDuration;
     
     // Finalize segment if time elapsed OR size limit reached
     if (timeElapsed || sizeExceeded) {
       // Finalize current segment
       if (this.currentSegmentPackets.length > 0) {
         const segmentData = Buffer.concat(this.currentSegmentPackets);
-        const actualDuration = elapsed - (this.currentSeqNum * this.segmentDuration);
+        const actualDuration = segmentElapsed; // Use actual measured duration
         const bitrateMbps = (segmentData.length * 8 / actualDuration / 1000000).toFixed(2);
         
         this.segments.push({
@@ -330,6 +331,7 @@ class StreamManager {
       this.currentSeqNum++;
       this.currentSegmentPackets = [];
       this.currentSegmentSize = 0; // Reset size counter
+      this.currentSegmentStartTime = Date.now(); // Reset segment timer
     }
   }
   

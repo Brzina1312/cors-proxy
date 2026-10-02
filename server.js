@@ -221,7 +221,6 @@ class StreamManager {
     if (this.isRunning) return;
     
     this.isRunning = true;
-    this.startTime = Date.now();
     
     console.log(`[${new Date().toISOString()}] StreamManager: Starting fetch for channel ${this.channelId}`);
     
@@ -284,6 +283,11 @@ class StreamManager {
   }
   
   addPacket(packet) {
+    // Set startTime on first packet arrival (fixes cold start timing bug)
+    if (!this.startTime) {
+      this.startTime = Date.now();
+    }
+    
     this.currentSegmentPackets.push(packet);
     this.totalPackets++;
     

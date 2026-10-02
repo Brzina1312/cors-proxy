@@ -238,7 +238,9 @@ function canUserStartStream(userId) {
     const idleTokens = [];
     for (const token of limits.activeStreams) {
       const session = sessionNormalizers.get(token);
-      if (session && now - session.lastAccess > 10000) { // Idle for 10+ seconds
+      // Only consider truly idle: no requests for 20s AND (not buffering OR has segments already)
+      // This prevents cleaning up new sessions that are still creating initial segments
+      if (session && now - session.lastAccess > 20000 && (!session.isBuffering || session.segments.length > 0)) {
         idleTokens.push(token);
       }
     }

@@ -373,8 +373,23 @@ const streamManagers = new Map(); // channelId -> StreamManager
 setInterval(() => {
   const now = Date.now();
   for (const [channelId, manager] of streamManagers.entries()) {
-    if (now - manager.lastAccessTime > 60000) { // 60 seconds inactive
-      console.log(`[${new Date().toISOString()}] Cleanup: Removing inactive stream for channel ${channelId}`);
+    const timeSinceLastAccess = now - manager.lastAccessTime;
+    
+    // Get timestamp of most recent segment to check if stream is still creating segments
+    const lastSegmentTime = manager.segments.length > 0 
+      ? manager.segments[manager.segments.length - 1].timestamp 
+      : manager.startTime || manager.lastAccessTime;
+    
+    const timeSinceLastSegment = now - lastSegmentTime;
+    
+    // Only cleanup if BOTH:
+    // 1. No access (playlist/segment requests) for 5 minutes AND
+    // 2. No new segments created for 5 minutes (stream actually dead)
+    // This prevents killing active streams when ExoPlayer is just buffering
+    const isInactive = timeSinceLastAccess > 300000 && timeSinceLastSegment > 300000;
+    
+    if (isInactive) {
+      console.log(`[${new Date().toISOString()}] Cleanup: Removing inactive stream for channel ${channelId} (last access: ${(timeSinceLastAccess/1000).toFixed(0)}s ago, last segment: ${(timeSinceLastSegment/1000).toFixed(0)}s ago)`);
       manager.stop();
       streamManagers.delete(channelId);
     }

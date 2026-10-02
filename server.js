@@ -147,11 +147,16 @@ app.get('/proxy', async (req, res) => {
 });
 
 // Token-based streaming endpoint (ExoPlayer compatible)
-// No redirects, direct HTTPS streaming with JWT validation
-// Now with pre-buffering and ExoPlayer-specific optimizations
-app.get('/stream/:token.:ext?', async (req, res) => {
+// Route accepts .ts extension but we strip it manually to avoid JWT parsing issues
+app.get('/stream/:token', async (req, res) => {
   try {
-    const { token } = req.params;
+    let { token } = req.params;
+    
+    // Strip .ts extension if present (added for ExoPlayer format recognition)
+    if (token.endsWith('.ts')) {
+      token = token.slice(0, -3);
+      console.log(`[${new Date().toISOString()}] Stripped .ts extension from token`);
+    }
     
     if (!token) {
       console.error(`[${new Date().toISOString()}] Missing token parameter`);

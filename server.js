@@ -236,6 +236,50 @@ setInterval(() => {
 // ============================================
 // Background Buffering Worker (Per-Session)
 // ============================================
+// Helper function to extract PTS from MPEG-TS packet
+function extractPTSFromPacket(packet) {
+  if (packet.length !== 188 || packet[0] !== 0x47) return null;
+  
+  const payloadUnitStartIndicator = (packet[1] & 0x40) !== 0;
+  const adaptationFieldControl = (packet[3] & 0x30) >> 4;
+  
+  if (adaptationFieldControl === 2) return null;
+  
+  let payloadStart = 4;
+  if (adaptationFieldControl === 3) {
+    const adaptationFieldLength = packet[4];
+    payloadStart = 5 + adaptationFieldLength;
+  }
+  
+  if (!payloadUnitStartIndicator || payloadStart + 9 >= 188) return null;
+  
+  if (packet[payloadStart] !== 0x00 || 
+      packet[payloadStart + 1] !== 0x00 || 
+      packet[payloadStart + 2] !== 0x01) {
+    return null;
+  }
+  
+  const pesHeaderDataLength = packet[payloadStart + 8];
+  const ptsDtsFlags = (packet[payloadStart + 7] & 0xC0) >> 6;
+  
+  if (ptsDtsFlags === 0 || payloadStart + 9 + pesHeaderDataLength >= 188) return null;
+  
+  const ptsPosition = payloadStart + 9;
+  
+  try {
+    const pts = (
+      ((packet[ptsPosition] & 0x0E) << 29) |
+      (packet[ptsPosition + 1] << 22) |
+      ((packet[ptsPosition + 2] & 0xFE) << 14) |
+      (packet[ptsPosition + 3] << 7) |
+      (packet[ptsPosition + 4] >> 1)
+    ) >>> 0;
+    return pts;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function startBuffering(session, token) {
   if (session.isBuffering) return;
   
@@ -244,8 +288,11 @@ async function startBuffering(session, token) {
   
   let packetBuffer = Buffer.alloc(0);
   let currentSegmentPackets = [];
+  let segmentStartPTS = null; // Track PTS at start of segment
+  let lastPTS = null; // Track most recent PTS
   let reconnectAttempts = 0;
   const MAX_RECONNECT_ATTEMPTS = 100;
+  const TARGET_SEGMENT_DURATION_PTS = 450000; // 5 seconds in 90kHz PTS units
   
   while (session.isBuffering && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
     try {
@@ -300,22 +347,45 @@ async function startBuffering(session, token) {
         const normalizedPacket = session.normalizer.normalizePacket(packet);
         currentSegmentPackets.push(normalizedPacket);
         
-        // When we have enough packets for a segment (6000 packets = ~5 seconds)
-        if (currentSegmentPackets.length >= 6000) {
+        // Extract PTS from normalized packet to track actual duration
+        const pts = extractPTSFromPacket(normalizedPacket);
+        if (pts !== null) {
+          lastPTS = pts;
+          if (segmentStartPTS === null) {
+            segmentStartPTS = pts;
+          }
+        }
+        
+        // Create segment when we have enough PTS duration (5 seconds = 450000 ticks at 90kHz)
+        // Or as fallback, use packet count if no PTS available
+        const ptsDuration = (lastPTS !== null && segmentStartPTS !== null) 
+          ? (lastPTS - segmentStartPTS) 
+          : null;
+        
+        const shouldFinalize = 
+          (ptsDuration !== null && ptsDuration >= TARGET_SEGMENT_DURATION_PTS) ||
+          (ptsDuration === null && currentSegmentPackets.length >= 6000);
+        
+        if (shouldFinalize && currentSegmentPackets.length > 0) {
           const segmentData = Buffer.concat(currentSegmentPackets);
+          
+          // Calculate actual duration in seconds
+          const actualDuration = ptsDuration !== null 
+            ? ptsDuration / 90000.0 
+            : 5.0; // fallback if no PTS
           
           const segment = {
             seqNum: session.currentSeqNum++,
             data: segmentData,
             timestamp: Date.now(),
-            duration: 5.0 // ~5 seconds per segment
+            duration: actualDuration
           };
           
           session.segments.push(segment);
           
           const oldestSeq = session.segments[0].seqNum;
           const newestSeq = segment.seqNum;
-          console.log(`[${new Date().toISOString()}] Buffering: Segment ${segment.seqNum} created (${(segmentData.length/1024).toFixed(1)} KB, buffer: ${session.segments.length} segments, range: ${oldestSeq}-${newestSeq})`);
+          console.log(`[${new Date().toISOString()}] Buffering: Segment ${segment.seqNum} created (${(segmentData.length/1024).toFixed(1)} KB, ${actualDuration.toFixed(2)}s, ${currentSegmentPackets.length} packets, buffer: ${session.segments.length} segments, range: ${oldestSeq}-${newestSeq})`);
           
           // Keep only last 90 segments (7.5 minutes of buffer)
           // Larger buffer prevents dropping segments before ExoPlayer can catch up
@@ -326,6 +396,8 @@ async function startBuffering(session, token) {
           
           // Reset for next segment
           currentSegmentPackets = [];
+          segmentStartPTS = null;
+          lastPTS = null;
         }
       }
       

@@ -415,6 +415,11 @@ async function startBuffering(session, token) {
   const MAX_RECONNECT_ATTEMPTS = 100;
   const TARGET_SEGMENT_DURATION_PTS = 450000; // 5 seconds in 90kHz PTS units
   
+  // Real-time throttling: Track segment creation rate
+  let segmentCreationTimes = []; // Array of timestamps when segments were created
+  const THROTTLE_WINDOW = 30000; // 30 second window for rate calculation
+  const MAX_SEGMENTS_PER_WINDOW = 12; // Max 12 segments in 30s (2x real-time for 5s segments)
+  
   while (session.isBuffering && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
     try {
       // Connect to portal if needed
@@ -527,6 +532,20 @@ async function startBuffering(session, token) {
           const oldestSeq = session.segments[0].seqNum;
           const newestSeq = segment.seqNum;
           console.log(`[${new Date().toISOString()}] Buffering: Segment ${segment.seqNum} created (${(segmentData.length/1024).toFixed(1)} KB, ${actualDuration.toFixed(2)}s, ${currentSegmentPackets.length} packets, buffer: ${session.segments.length} segments, range: ${oldestSeq}-${newestSeq})`);
+          
+          // Real-time throttling: Track segment creation and throttle if too fast
+          const now = Date.now();
+          segmentCreationTimes.push(now);
+          
+          // Remove old timestamps outside the window
+          segmentCreationTimes = segmentCreationTimes.filter(t => now - t < THROTTLE_WINDOW);
+          
+          // If creating segments too fast (>2x real-time), throttle
+          if (segmentCreationTimes.length > MAX_SEGMENTS_PER_WINDOW) {
+            const throttleDelay = 2500; // 2.5 second delay to slow down
+            console.log(`[${new Date().toISOString()}] Buffering: Rate too fast (${segmentCreationTimes.length} segments in ${THROTTLE_WINDOW/1000}s), throttling ${throttleDelay}ms`);
+            await new Promise(resolve => setTimeout(resolve, throttleDelay));
+          }
           
           // Keep only last 90 segments (7.5 minutes of buffer)
           // Larger buffer prevents dropping segments before ExoPlayer can catch up
@@ -662,7 +681,7 @@ app.get('/stream/:token.m3u8', async (req, res) => {
     const lines = [
       '#EXTM3U',
       '#EXT-X-VERSION:3',
-      `#EXT-X-TARGETDURATION:${SEGMENT_DURATION + 1}`,
+      '#EXT-X-TARGETDURATION:10',  // Max segment duration (clamped to 10s in normalizer)
       `#EXT-X-MEDIA-SEQUENCE:${oldestSegment}`
     ];
     

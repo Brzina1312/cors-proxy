@@ -201,19 +201,20 @@ class MPEGTSNormalizer {
 // HLS Stream Manager (Segmented Live Streaming)
 // ============================================
 class StreamManager {
-  constructor(token, streamUrl) {
-    this.token = token;
+  constructor(channelId, streamUrl) {
+    this.channelId = channelId;
     this.streamUrl = streamUrl;
     this.segments = []; // [{seqNum, data: Buffer, packetCount}]
     this.currentSeqNum = 0;
     this.currentSegmentPackets = [];
     this.segmentDuration = 6; // seconds per segment
-    this.maxSegments = 5; // Keep 5 segments = 30 seconds buffer
+    this.maxSegments = 8; // Keep 8 segments = 48 seconds buffer
     this.normalizer = new MPEGTSNormalizer();
     this.lastAccessTime = Date.now();
     this.isRunning = false;
     this.startTime = null;
     this.totalPackets = 0;
+    this.activeUsers = 0; // Track how many users are watching
   }
   
   async startFetching() {
@@ -222,7 +223,7 @@ class StreamManager {
     this.isRunning = true;
     this.startTime = Date.now();
     
-    console.log(`[${new Date().toISOString()}] StreamManager: Starting fetch for token ${this.token.substring(0, 20)}...`);
+    console.log(`[${new Date().toISOString()}] StreamManager: Starting fetch for channel ${this.channelId}`);
     
     this.fetchLoop();
   }
@@ -341,17 +342,17 @@ class StreamManager {
   }
 }
 
-// Global stream managers
-const streamManagers = new Map(); // token -> StreamManager
+// Global stream managers (shared by channelId for scalability)
+const streamManagers = new Map(); // channelId -> StreamManager
 
 // Cleanup inactive streams every 30 seconds
 setInterval(() => {
   const now = Date.now();
-  for (const [token, manager] of streamManagers.entries()) {
+  for (const [channelId, manager] of streamManagers.entries()) {
     if (now - manager.lastAccessTime > 60000) { // 60 seconds inactive
-      console.log(`[${new Date().toISOString()}] Cleanup: Removing inactive stream ${token.substring(0, 20)}...`);
+      console.log(`[${new Date().toISOString()}] Cleanup: Removing inactive stream for channel ${channelId}`);
       manager.stop();
-      streamManagers.delete(token);
+      streamManagers.delete(channelId);
     }
   }
 }, 30000);
@@ -381,14 +382,18 @@ app.get('/stream/:token.m3u8', async (req, res) => {
 
     console.log(`[${new Date().toISOString()}] HLS Playlist request: userId=${payload.userId}, ch=${payload.channelId}`);
 
-    // Get or create StreamManager
-    let manager = streamManagers.get(token);
+    // Get or create StreamManager (shared by channel for scalability)
+    const channelId = payload.channelId;
+    let manager = streamManagers.get(channelId);
     if (!manager) {
-      console.log(`[${new Date().toISOString()}] Creating new StreamManager for ch=${payload.channelId}`);
-      manager = new StreamManager(token, payload.streamUrl);
-      streamManagers.set(token, manager);
+      console.log(`[${new Date().toISOString()}] Creating new StreamManager for ch=${channelId}`);
+      manager = new StreamManager(channelId, payload.streamUrl);
+      streamManagers.set(channelId, manager);
       manager.startFetching(); // Start background fetching
+    } else {
+      console.log(`[${new Date().toISOString()}] Reusing StreamManager for ch=${channelId} (${manager.activeUsers} active users)`);
     }
+    manager.activeUsers++;
 
     const baseUrl = req.protocol + '://' + req.get('host');
     const playlist = manager.getPlaylist(baseUrl, token);
@@ -398,7 +403,7 @@ app.get('/stream/:token.m3u8', async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     
     res.send(playlist);
-    console.log(`[${new Date().toISOString()}] HLS Playlist sent (${manager.segments.length} segments available)`);
+    console.log(`[${new Date().toISOString()}] HLS Playlist sent (${manager.segments.length} segments, ${manager.activeUsers} users)`);
 
   } catch (error) {
     console.error(`[${new Date().toISOString()}] HLS playlist error:`, error.message);
@@ -434,10 +439,11 @@ app.get('/stream/:token/seg/:seqNum.ts', async (req, res) => {
 
     console.log(`[${new Date().toISOString()}] Segment request: ch=${payload.channelId}, seq=${seqNum}`);
 
-    // Get StreamManager
-    const manager = streamManagers.get(token);
+    // Get StreamManager by channelId
+    const channelId = payload.channelId;
+    const manager = streamManagers.get(channelId);
     if (!manager) {
-      console.error(`[${new Date().toISOString()}] No StreamManager found for token`);
+      console.error(`[${new Date().toISOString()}] No StreamManager found for channel ${channelId}`);
       return res.status(404).json({ error: 'Stream not found' });
     }
 

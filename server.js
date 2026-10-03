@@ -35,6 +35,29 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// MAC status check endpoint - used by worker to check if MAC is already streaming
+// This allows the stream handler to show an informational message instead of an error
+app.get('/check-mac/:macId', (req, res) => {
+  const { macId } = req.params;
+  
+  if (!macId) {
+    return res.status(400).json({ 
+      error: 'Missing macId parameter',
+      inUse: false 
+    });
+  }
+  
+  const macStatus = isMACAlreadyStreaming(macId);
+  
+  console.log(`[${new Date().toISOString()}] MAC status check: ${macId}, inUse: ${macStatus.inUse}`);
+  
+  res.json({
+    inUse: macStatus.inUse,
+    userId: macStatus.userId || null,
+    startTime: macStatus.startTime || null
+  });
+});
+
 // Process request queue
 async function processQueue() {
   if (isProcessingQueue || requestQueue.length === 0) {

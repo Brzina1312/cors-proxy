@@ -210,6 +210,9 @@ const MAX_ACTIVE_STREAMS_PER_USER = 3; // Allow multiple devices per user
 const MIN_STREAM_START_INTERVAL = 2000; // 2 seconds between new streams
 const STREAM_START_TIMEOUT = 15000; // 15 seconds to create first segment or mark broken
 
+// Protection: Per-MAC concurrent session blocking (one connection per MAC at a time)
+const activeMACStreams = new Map(); // macId -> {token, userId, startTime}
+
 // Protection: Broken channel detection
 const brokenChannels = new Map(); // channelId -> blockedUntil timestamp
 const BROKEN_CHANNEL_COOLDOWN = 5 * 60 * 1000; // 5 minutes
@@ -266,6 +269,42 @@ function canUserStartStream(userId) {
   
   limits.lastStreamStart = now;
   return { allowed: true };
+}
+
+function isMACAlreadyStreaming(macId) {
+  const activeStream = activeMACStreams.get(macId);
+  if (!activeStream) {
+    return { inUse: false };
+  }
+  
+  // Check if the session still exists (might have been cleaned up)
+  const session = sessionNormalizers.get(activeStream.token);
+  if (!session) {
+    // Session no longer exists, clean up MAC tracking
+    activeMACStreams.delete(macId);
+    return { inUse: false };
+  }
+  
+  return { 
+    inUse: true, 
+    userId: activeStream.userId,
+    startTime: activeStream.startTime 
+  };
+}
+
+function registerMACStream(macId, token, userId) {
+  activeMACStreams.set(macId, {
+    token,
+    userId,
+    startTime: Date.now()
+  });
+  console.log(`[${new Date().toISOString()}] MAC ${macId} registered for user ${userId}`);
+}
+
+function unregisterMACStream(macId) {
+  if (activeMACStreams.delete(macId)) {
+    console.log(`[${new Date().toISOString()}] MAC ${macId} unregistered`);
+  }
 }
 
 function isChannelBroken(channelId) {
@@ -331,7 +370,21 @@ function cleanupSession(token, reason = 'cleanup') {
     unregisterActiveStream(session.userId, token);
   }
   
-  // Delete session (segments will be garbage collected)
+  // Unregister MAC if this session is holding it
+  if (session.macId) {
+    const activeMAC = activeMACStreams.get(session.macId);
+    if (activeMAC && activeMAC.token === token) {
+      unregisterMACStream(session.macId);
+    }
+  }
+  
+  // Clear segments array explicitly to help garbage collection
+  if (session.segments) {
+    session.segments.length = 0;
+    session.segments = null;
+  }
+  
+  // Delete session (remaining references will be garbage collected)
   sessionNormalizers.delete(token);
 }
 
@@ -449,6 +502,18 @@ async function startBuffering(session, token) {
             break;
           }
           
+          // Handle 407 (Authentication/Connection Error) with exponential backoff
+          // Prevents constant retry loops that can overload the portal
+          if (portalResponse.status === 407) {
+            // Exponential backoff: 5s, 10s, 20s, 40s, up to 60s max
+            const backoffDelay = Math.min(5000 * Math.pow(2, reconnectAttempts), 60000);
+            console.warn(`[${new Date().toISOString()}] Buffering: Error 407 (auth/connection issue), exponential backoff ${backoffDelay}ms (attempt ${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})`);
+            reconnectAttempts++;
+            await new Promise(resolve => setTimeout(resolve, backoffDelay));
+            continue;
+          }
+          
+          // Other errors: use standard retry delay
           reconnectAttempts++;
           await new Promise(resolve => setTimeout(resolve, 2000));
           continue;
@@ -547,11 +612,12 @@ async function startBuffering(session, token) {
             await new Promise(resolve => setTimeout(resolve, throttleDelay));
           }
           
-          // Keep only last 90 segments (7.5 minutes of buffer)
-          // Larger buffer prevents dropping segments before ExoPlayer can catch up
-          if (session.segments.length > 90) {
+          // Keep only last 30 segments (2.5 minutes of buffer)
+          // Reduced from 90 to save memory: 30 segments = ~150MB for HD vs 90 = ~450MB
+          // This allows 3-4 concurrent HD users on 512MB RAM instead of just 1
+          if (session.segments.length > 30) {
             const removed = session.segments.shift();
-            console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 90)`);
+            console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 30)`);
           }
           
           // Reset for next segment
@@ -626,6 +692,18 @@ app.get('/stream/:token.m3u8', async (req, res) => {
         return res.status(429).json({ error: canStart.reason });
       }
       
+      // Protection: Check if MAC is already streaming (one connection per MAC)
+      if (payload.macId) {
+        const macStatus = isMACAlreadyStreaming(payload.macId);
+        if (macStatus.inUse) {
+          console.warn(`[${new Date().toISOString()}] MAC ${payload.macId} already streaming for user ${macStatus.userId}`);
+          return res.status(409).json({ 
+            error: 'Active connection detected',
+            message: 'This subscription is already being used on another device. Only one device can stream at a time per subscription.'
+          });
+        }
+      }
+      
       // Protection: Check if channel is broken
       if (isChannelBroken(payload.channelId)) {
         console.warn(`[${new Date().toISOString()}] Channel ${payload.channelId} is marked as broken`);
@@ -638,6 +716,7 @@ app.get('/stream/:token.m3u8', async (req, res) => {
         streamUrl: payload.streamUrl,
         userId: payload.userId,
         channelId: payload.channelId,
+        macId: payload.macId || null, // Track MAC ID for concurrent session blocking
         segments: [], // Buffer of available segments
         currentSeqNum: 0, // Next segment number to create
         isBuffering: false,
@@ -649,6 +728,11 @@ app.get('/stream/:token.m3u8', async (req, res) => {
       
       // Register as active stream for this user
       registerActiveStream(payload.userId, token);
+      
+      // Register MAC as active if provided
+      if (payload.macId) {
+        registerMACStream(payload.macId, token, payload.userId);
+      }
       
       console.log(`[${new Date().toISOString()}] New session created for user ${payload.userId}, channel ${payload.channelId}`);
       

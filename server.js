@@ -562,10 +562,10 @@ async function startBuffering(session, token) {
       // Reset reconnect counter on successful read
       reconnectAttempts = 0;
       
-      // Protection: Stop buffering if client disconnected (no requests for 3+ seconds)
-      // Reduced from 10s to 3s for faster channel switching without "already streaming" errors
-      if (Date.now() - session.lastAccess > 3000 && session.segments.length > 0) {
-        console.log(`[${new Date().toISOString()}] Buffering: Client inactive for 3s, stopping`);
+      // Protection: Stop buffering if client disconnected (no requests for 15+ seconds)
+      // Increased from 3s to 15s to allow normal HLS buffering (segments are 5s, clients buffer ahead)
+      if (Date.now() - session.lastAccess > 15000 && session.segments.length > 0) {
+        console.log(`[${new Date().toISOString()}] Buffering: Client inactive for 15s, stopping`);
         cleanupSession(token, 'client disconnected');
         break;
       }

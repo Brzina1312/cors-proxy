@@ -411,14 +411,14 @@ function cleanupSession(token, reason = 'cleanup') {
   sessionNormalizers.delete(token);
 }
 
-// Cleanup inactive sessions every 10 seconds
+// Cleanup inactive sessions every 5 seconds
 setInterval(() => {
   const now = Date.now();
-  const INACTIVE_TIMEOUT = 10 * 1000; // 10 seconds (reduced from 30s for faster cleanup)
+  const INACTIVE_TIMEOUT = 5 * 1000; // 5 seconds (reduced from 10s for faster channel switching)
   
   for (const [token, session] of sessionNormalizers.entries()) {
     if (now - session.lastAccess > INACTIVE_TIMEOUT) {
-      cleanupSession(token, 'inactive for 10s');
+      cleanupSession(token, 'inactive for 5s');
     }
   }
   
@@ -428,7 +428,7 @@ setInterval(() => {
       userStreamLimits.delete(userId);
     }
   }
-}, 10000); // Run every 10 seconds to match INACTIVE_TIMEOUT
+}, 5000); // Run every 5 seconds for faster channel switching
 
 // ============================================
 // Background Buffering Worker (Per-Session)
@@ -562,9 +562,15 @@ async function startBuffering(session, token) {
       // Reset reconnect counter on successful read
       reconnectAttempts = 0;
       
+      // Check if session was stopped by cleanup
+      if (!session.isBuffering) {
+        console.log(`[${new Date().toISOString()}] Buffering stopped for session ${token.substring(0, 8)}`);
+        break;
+      }
+      
       // Protection: Stop buffering if client disconnected (no requests for 15+ seconds)
       // Increased from 3s to 15s to allow normal HLS buffering (segments are 5s, clients buffer ahead)
-      if (Date.now() - session.lastAccess > 15000 && session.segments.length > 0) {
+      if (session.segments && Date.now() - session.lastAccess > 15000 && session.segments.length > 0) {
         console.log(`[${new Date().toISOString()}] Buffering: Client inactive for 15s, stopping`);
         cleanupSession(token, 'client disconnected');
         break;

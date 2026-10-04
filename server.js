@@ -411,14 +411,14 @@ function cleanupSession(token, reason = 'cleanup') {
   sessionNormalizers.delete(token);
 }
 
-// Cleanup inactive sessions every 30 seconds
+// Cleanup inactive sessions every 10 seconds
 setInterval(() => {
   const now = Date.now();
-  const INACTIVE_TIMEOUT = 30 * 1000; // 30 seconds (reduced from 5 minutes)
+  const INACTIVE_TIMEOUT = 10 * 1000; // 10 seconds (reduced from 30s for faster cleanup)
   
   for (const [token, session] of sessionNormalizers.entries()) {
     if (now - session.lastAccess > INACTIVE_TIMEOUT) {
-      cleanupSession(token, 'inactive for 30s');
+      cleanupSession(token, 'inactive for 10s');
     }
   }
   
@@ -428,7 +428,7 @@ setInterval(() => {
       userStreamLimits.delete(userId);
     }
   }
-}, 30000); // Run every 30 seconds to match INACTIVE_TIMEOUT
+}, 10000); // Run every 10 seconds to match INACTIVE_TIMEOUT
 
 // ============================================
 // Background Buffering Worker (Per-Session)
@@ -562,9 +562,10 @@ async function startBuffering(session, token) {
       // Reset reconnect counter on successful read
       reconnectAttempts = 0;
       
-      // Protection: Stop buffering if client disconnected (no requests for 10+ seconds)
-      if (Date.now() - session.lastAccess > 10000 && session.segments.length > 0) {
-        console.log(`[${new Date().toISOString()}] Buffering: Client inactive for 10s, stopping`);
+      // Protection: Stop buffering if client disconnected (no requests for 3+ seconds)
+      // Reduced from 10s to 3s for faster channel switching without "already streaming" errors
+      if (Date.now() - session.lastAccess > 3000 && session.segments.length > 0) {
+        console.log(`[${new Date().toISOString()}] Buffering: Client inactive for 3s, stopping`);
         cleanupSession(token, 'client disconnected');
         break;
       }

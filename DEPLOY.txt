@@ -1,0 +1,22 @@
+Deploy updated CORS proxy to Render.com:
+
+Option 1: GitHub Auto-Deploy
+cd cors-proxy
+git add server.js
+git commit -m "Add success logging to debug ExoPlayer issue"
+git push
+
+Option 2: Manual Deploy
+1. Go to https://dashboard.render.com
+2. Click cors-proxy-t04o
+3. Manual Deploy → Deploy latest commit
+4. Wait 2-3 minutes
+
+Then test:
+1. Open Stremio on Android
+2. Play channel with ExoPlayer (default player)
+3. Check Render logs for new line:
+   "Proxy success: 200, Content-Type: ..."
+
+This will show us what Content-Type the portal returns,
+which might explain why ExoPlayer fails but MPV works.

@@ -423,16 +423,52 @@ function cleanupSession(token, reason = 'cleanup') {
   
   console.log(`[${new Date().toISOString()}] Cleanup: ${reason} for session ${token.substring(0, 8)}`);
   
-  // Stop buffering worker
+  // Stop buffering worker FIRST
   session.isBuffering = false;
   
-  // Close portal connection
+  // Aggressively destroy portal connection and streams
   if (session.portalResponse) {
     try {
-      session.portalResponse.body.cancel();
+      if (session.portalResponse.body) {
+        session.portalResponse.body.cancel();
+        // Also try to destroy the stream if available
+        if (typeof session.portalResponse.body.destroy === 'function') {
+          session.portalResponse.body.destroy();
+        }
+      }
     } catch (e) {
       // Ignore errors during cleanup
     }
+    session.portalResponse = null; // CRITICAL: Clear the reference to free memory
+  }
+  
+  // Clear portal stream if exists
+  if (session.portalStream) {
+    try {
+      if (typeof session.portalStream.destroy === 'function') {
+        session.portalStream.destroy();
+      }
+    } catch (e) {
+      // Ignore errors
+    }
+    session.portalStream = null;
+  }
+  
+  // Clear normalizer to free PTS state
+  if (session.normalizer) {
+    session.normalizer = null;
+  }
+  
+  // Clear segments array explicitly to help garbage collection
+  if (session.segments) {
+    // Explicitly null out each segment buffer before clearing array
+    for (let i = 0; i < session.segments.length; i++) {
+      if (session.segments[i] && session.segments[i].data) {
+        session.segments[i].data = null;
+      }
+    }
+    session.segments.length = 0;
+    session.segments = null;
   }
   
   // Unregister from user's active streams
@@ -448,24 +484,22 @@ function cleanupSession(token, reason = 'cleanup') {
     }
   }
   
-  // Clear segments array explicitly to help garbage collection
-  if (session.segments) {
-    session.segments.length = 0;
-    session.segments = null;
-  }
-  
   // Delete session (remaining references will be garbage collected)
   sessionNormalizers.delete(token);
+  
+  // Log memory usage after cleanup for debugging
+  const memUsage = process.memoryUsage();
+  console.log(`[${new Date().toISOString()}] Memory after cleanup: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB heap, ${sessionNormalizers.size} active sessions`);
 }
 
-// Cleanup inactive sessions every 5 seconds
+// Cleanup inactive sessions every 3 seconds (faster cleanup = faster memory release)
 setInterval(() => {
   const now = Date.now();
-  const INACTIVE_TIMEOUT = 10 * 1000; // 10 seconds (balance between playback stability and channel switching)
+  const INACTIVE_TIMEOUT = 5 * 1000; // 5 seconds (faster cleanup while maintaining channel switching logic)
   
   for (const [token, session] of sessionNormalizers.entries()) {
     if (now - session.lastAccess > INACTIVE_TIMEOUT) {
-      cleanupSession(token, 'inactive for 10s');
+      cleanupSession(token, 'inactive for 5s');
     }
   }
   
@@ -473,6 +507,27 @@ setInterval(() => {
   for (const [userId, limits] of userStreamLimits.entries()) {
     if (limits.activeStreams.size === 0 && now - limits.lastStreamStart > 10 * 60 * 1000) {
       userStreamLimits.delete(userId);
+    }
+  }
+  
+  // MEMORY LEAK FIX: Cleanup old userRequestTracker entries
+  // Remove entries where all timestamps are older than the request window (10s)
+  for (const [userId, timestamps] of userRequestTracker.entries()) {
+    const recentRequests = timestamps.filter(time => now - time < USER_REQUEST_WINDOW);
+    if (recentRequests.length === 0) {
+      // No recent requests, remove entry completely
+      userRequestTracker.delete(userId);
+    } else if (recentRequests.length < timestamps.length) {
+      // Some old timestamps, update array with only recent ones
+      userRequestTracker.set(userId, recentRequests);
+    }
+  }
+  
+  // Cleanup stale MAC entries (where session no longer exists)
+  for (const [macId, activeStream] of activeMACStreams.entries()) {
+    if (!sessionNormalizers.has(activeStream.token)) {
+      activeMACStreams.delete(macId);
+      console.log(`[${new Date().toISOString()}] Cleaned up stale MAC entry: ${macId}`);
     }
   }
 }, 5000); // Run every 5 seconds for faster channel switching

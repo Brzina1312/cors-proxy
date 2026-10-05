@@ -793,10 +793,15 @@ async function startBuffering(session, token) {
         if (shouldFinalize && currentSegmentPackets.length > 0) {
           const segmentData = Buffer.concat(currentSegmentPackets);
           
-          // Calculate actual duration in seconds and clamp to reasonable range
-          // Prevents PTS discontinuities from creating insane durations (e.g., 47721s)
+          // Calculate actual duration based on how segment was created
           const rawDuration = ptsDuration !== null ? ptsDuration / 90000.0 : 5.0;
-          const actualDuration = Math.min(10.0, Math.max(2.0, rawDuration));
+          
+          // If segment was created by PTS duration (>= 5s), use actual PTS-based duration
+          // If created by packet count fallback (1500 packets), use 5s estimate since PTS is unreliable
+          const wasCreatedByPTS = ptsDuration !== null && ptsDuration >= TARGET_SEGMENT_DURATION_PTS;
+          const actualDuration = wasCreatedByPTS 
+            ? Math.min(10.0, Math.max(2.0, rawDuration))  // Clamp PTS-based duration
+            : 5.0;  // Fixed duration for packet-count-based segments
           
           const segment = {
             seqNum: session.currentSeqNum++,
@@ -836,7 +841,8 @@ async function startBuffering(session, token) {
           // Keep only last 10 segments (~50 seconds of buffer)
           // Optimized for memory: 10 segments × 4MB avg = ~40MB per stream (vs 30 segments = ~120MB)
           // This allows 8-10 concurrent users on 512MB RAM with smooth playback
-          if (session.segments.length > 10) {
+          // Don't drop segments until playback has started (first segment served) to prevent "segment 0 not found" errors
+          if (session.segments.length > 10 && session.playbackStarted) {
             const removed = session.segments.shift();
             console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 10)`);
           }
@@ -957,7 +963,8 @@ app.get('/stream/:token.m3u8', async (req, res) => {
         isBuffering: false,
         portalStream: null,
         portalResponse: null,
-        startTime: Date.now() // Track when stream started for timeout detection
+        startTime: Date.now(), // Track when stream started for timeout detection
+        playbackStarted: false // Track if player has started consuming segments
       };
       sessionNormalizers.set(token, session);
       
@@ -1076,6 +1083,12 @@ app.get('/stream/:token/seg/:seqNum.ts', async (req, res) => {
 
     // Serve buffered segment
     console.log(`[${new Date().toISOString()}] Serving segment ${seqNum} from buffer (${(segment.data.length/1024).toFixed(1)} KB)`);
+    
+    // Mark that playback has started (player is consuming segments)
+    if (!session.playbackStarted) {
+      session.playbackStarted = true;
+      console.log(`[${new Date().toISOString()}] Playback started for session (first segment served)`);
+    }
     
     res.status(200);
     res.setHeader('Content-Type', 'video/mp2t');

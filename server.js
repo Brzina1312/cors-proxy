@@ -553,9 +553,21 @@ setInterval(() => {
     }
   }
   
-  // Force garbage collection if available to release memory faster
+  // AGGRESSIVE MEMORY MANAGEMENT: Force GC periodically to release memory back to OS
+  // This helps prevent the "high water mark" issue where RSS stays at peak usage
   if (global.gc) {
     global.gc();
+    
+    // Log memory stats every minute for monitoring
+    const memUsage = process.memoryUsage();
+    const heapMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+    const rssMB = Math.round(memUsage.rss / 1024 / 1024);
+    const externalMB = Math.round(memUsage.external / 1024 / 1024);
+    
+    // Only log if we have memory worth reporting
+    if (rssMB > 100 || sessionNormalizers.size > 0) {
+      console.log(`[${new Date().toISOString()}] Memory stats: ${heapMB}MB heap, ${rssMB}MB RSS, ${externalMB}MB external, ${sessionNormalizers.size} active sessions`);
+    }
   }
 }, 5000); // Run every 5 seconds for faster channel switching
 

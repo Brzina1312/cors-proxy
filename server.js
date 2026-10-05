@@ -37,8 +37,10 @@ app.get('/health', (req, res) => {
 
 // MAC status check endpoint - used by worker to check if MAC is already streaming
 // This allows the stream handler to show an informational message instead of an error
+// If userId is provided and matches existing stream, check if old session is inactive (channel switching)
 app.get('/check-mac/:macId', (req, res) => {
   const { macId } = req.params;
+  const requestUserId = req.query.userId; // Optional: user requesting the stream
   
   if (!macId) {
     return res.status(400).json({ 
@@ -49,7 +51,52 @@ app.get('/check-mac/:macId', (req, res) => {
   
   const macStatus = isMACAlreadyStreaming(macId);
   
-  console.log(`[${new Date().toISOString()}] MAC status check: ${macId}, inUse: ${macStatus.inUse}`);
+  // If MAC is in use AND requesting user is the same user → Check if old session is inactive
+  if (macStatus.inUse && requestUserId && macStatus.userId === requestUserId) {
+    const activeStream = activeMACStreams.get(macId);
+    const session = activeStream ? sessionNormalizers.get(activeStream.token) : null;
+    
+    if (session) {
+      const timeSinceLastAccess = Date.now() - session.lastAccess;
+      const INACTIVE_THRESHOLD = 3000; // 3 seconds - if no activity for 3s, consider it inactive (player closed)
+      
+      if (timeSinceLastAccess > INACTIVE_THRESHOLD) {
+        // Old session is inactive (player was closed) - allow channel switching
+        console.log(`[${new Date().toISOString()}] MAC ${macId}: Same user ${requestUserId} switching channels - old session inactive (${Math.round(timeSinceLastAccess/1000)}s), forcing cleanup`);
+        
+        cleanupSession(activeStream.token, 'force takeover - inactive session, channel switching');
+        
+        return res.json({
+          inUse: false,
+          forcedTakeover: true,
+          reason: 'inactive_session'
+        });
+      } else {
+        // Old session is still active (player is playing) - this is concurrent streaming attempt
+        console.log(`[${new Date().toISOString()}] MAC ${macId}: Same user ${requestUserId} tried concurrent stream - old session active (${Math.round(timeSinceLastAccess/1000)}s ago), blocking`);
+        
+        return res.json({
+          inUse: true,
+          userId: macStatus.userId,
+          startTime: macStatus.startTime,
+          reason: 'active_session'
+        });
+      }
+    } else {
+      // Session doesn't exist (race condition?) - allow takeover
+      console.log(`[${new Date().toISOString()}] MAC ${macId}: Session not found but MAC registered - cleaning up`);
+      activeMACStreams.delete(macId);
+      
+      return res.json({
+        inUse: false,
+        forcedTakeover: true,
+        reason: 'session_not_found'
+      });
+    }
+  }
+  
+  // MAC not in use, or different user (block multi-device)
+  console.log(`[${new Date().toISOString()}] MAC status check: ${macId}, inUse: ${macStatus.inUse}, userId: ${macStatus.userId || 'none'}, requestUserId: ${requestUserId || 'none'}`);
   
   res.json({
     inUse: macStatus.inUse,

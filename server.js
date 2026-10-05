@@ -781,14 +781,14 @@ async function startBuffering(session, token) {
         }
         
         // Create segment when we have enough PTS duration (5 seconds = 450000 ticks at 90kHz)
-        // Or as fallback, use packet count if no PTS available
+        // Or as fallback, use packet count for slow/sparse PTS streams
         const ptsDuration = (lastPTS !== null && segmentStartPTS !== null) 
           ? (lastPTS - segmentStartPTS) 
           : null;
         
         const shouldFinalize = 
           (ptsDuration !== null && ptsDuration >= TARGET_SEGMENT_DURATION_PTS) ||
-          (ptsDuration === null && currentSegmentPackets.length >= 6000);
+          (currentSegmentPackets.length >= 1500); // Fallback for slow bitrate channels (~280KB)
         
         if (shouldFinalize && currentSegmentPackets.length > 0) {
           const segmentData = Buffer.concat(currentSegmentPackets);
@@ -853,7 +853,7 @@ async function startBuffering(session, token) {
             Date.now() - session.startTime > STREAM_START_TIMEOUT) {
           const ptsDuration = (lastPTS !== null && segmentStartPTS !== null) ? (lastPTS - segmentStartPTS) : null;
           console.error(`[${new Date().toISOString()}] Buffering: Stream failed to create segments within ${STREAM_START_TIMEOUT/1000}s, marking as broken`);
-          console.error(`[${new Date().toISOString()}] Buffering diagnostics: ${totalBytesReceived} bytes received, ${totalPacketsExtracted} packets extracted, ${ptsFoundCount} PTS found, ${currentSegmentPackets.length} packets in current segment, PTS duration: ${ptsDuration ? (ptsDuration / 90000).toFixed(2) + 's (need 5.0s)' : 'N/A (fallback: need 6000 packets)'}`);
+          console.error(`[${new Date().toISOString()}] Buffering diagnostics: ${totalBytesReceived} bytes received, ${totalPacketsExtracted} packets extracted, ${ptsFoundCount} PTS found, ${currentSegmentPackets.length} packets in current segment, PTS duration: ${ptsDuration ? (ptsDuration / 90000).toFixed(2) + 's (need 5.0s or 1500 packets)' : 'N/A (fallback: need 1500 packets)'}`);
           // Mark channel as broken BEFORE cleanup
           if (session.channelId) {
             markChannelBroken(session.channelId, 'timeout - no segments');

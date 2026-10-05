@@ -793,15 +793,10 @@ async function startBuffering(session, token) {
         if (shouldFinalize && currentSegmentPackets.length > 0) {
           const segmentData = Buffer.concat(currentSegmentPackets);
           
-          // Calculate actual duration based on how segment was created
+          // Calculate actual duration in seconds and clamp to reasonable range
+          // Prevents PTS discontinuities from creating insane durations (e.g., 47721s)
           const rawDuration = ptsDuration !== null ? ptsDuration / 90000.0 : 5.0;
-          
-          // If segment was created by PTS duration (>= 5s), use actual PTS-based duration
-          // If created by packet count fallback (1500 packets), use 5s estimate since PTS is unreliable
-          const wasCreatedByPTS = ptsDuration !== null && ptsDuration >= TARGET_SEGMENT_DURATION_PTS;
-          const actualDuration = wasCreatedByPTS 
-            ? Math.min(10.0, Math.max(2.0, rawDuration))  // Clamp PTS-based duration
-            : 5.0;  // Fixed duration for packet-count-based segments
+          const actualDuration = Math.min(10.0, Math.max(2.0, rawDuration));
           
           const segment = {
             seqNum: session.currentSeqNum++,
@@ -842,17 +837,9 @@ async function startBuffering(session, token) {
           // Optimized for memory: 10 segments × 4MB avg = ~40MB per stream (vs 30 segments = ~120MB)
           // This allows 8-10 concurrent users on 512MB RAM with smooth playback
           // Don't drop segments until playback has started (first segment served) to prevent "segment 0 not found" errors
-          // Only drop segments that are safely behind the player's current position (lastServedSegmentNum - 3)
           if (session.segments.length > 10 && session.playbackStarted) {
-            const oldestSegment = session.segments[0];
-            const lastServed = session.lastServedSegmentNum || 0;
-            
-            // Only drop if the oldest segment is at least 3 positions behind the last served segment
-            // This keeps a safety buffer of segments the player might still need
-            if (oldestSegment.seqNum < lastServed - 3) {
-              const removed = session.segments.shift();
-              console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 10, lastServed: ${lastServed})`);
-            }
+            const removed = session.segments.shift();
+            console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 10)`);
           }
           
           // Reset for next segment

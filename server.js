@@ -278,7 +278,7 @@ const sessionNormalizers = new Map(); // token -> {normalizer, segments, isBuffe
 const userStreamLimits = new Map(); // userId -> {activeStreams: Set, lastStreamStart: timestamp, 429Until: timestamp}
 const MAX_ACTIVE_STREAMS_PER_USER = 3; // Allow multiple devices per user
 const MIN_STREAM_START_INTERVAL = 2000; // 2 seconds between new streams
-const STREAM_START_TIMEOUT = 15000; // 15 seconds to create first segment or mark broken
+const STREAM_START_TIMEOUT = 30000; // 30 seconds to create first segment or mark broken
 
 // Protection: Per-MAC concurrent session blocking (one connection per MAC at a time)
 const activeMACStreams = new Map(); // macId -> {token, userId, startTime}
@@ -788,7 +788,7 @@ async function startBuffering(session, token) {
         
         const shouldFinalize = 
           (ptsDuration !== null && ptsDuration >= TARGET_SEGMENT_DURATION_PTS) ||
-          (currentSegmentPackets.length >= 1500); // Fallback for slow bitrate channels (~280KB)
+          (currentSegmentPackets.length >= 6000); // Fallback when no PTS available (~1.1MB)
         
         if (shouldFinalize && currentSegmentPackets.length > 0) {
           const segmentData = Buffer.concat(currentSegmentPackets);
@@ -867,7 +867,7 @@ async function startBuffering(session, token) {
             Date.now() - session.startTime > STREAM_START_TIMEOUT) {
           const ptsDuration = (lastPTS !== null && segmentStartPTS !== null) ? (lastPTS - segmentStartPTS) : null;
           console.error(`[${new Date().toISOString()}] Buffering: Stream failed to create segments within ${STREAM_START_TIMEOUT/1000}s, marking as broken`);
-          console.error(`[${new Date().toISOString()}] Buffering diagnostics: ${totalBytesReceived} bytes received, ${totalPacketsExtracted} packets extracted, ${ptsFoundCount} PTS found, ${currentSegmentPackets.length} packets in current segment, PTS duration: ${ptsDuration ? (ptsDuration / 90000).toFixed(2) + 's (need 5.0s or 1500 packets)' : 'N/A (fallback: need 1500 packets)'}`);
+          console.error(`[${new Date().toISOString()}] Buffering diagnostics: ${totalBytesReceived} bytes received, ${totalPacketsExtracted} packets extracted, ${ptsFoundCount} PTS found, ${currentSegmentPackets.length} packets in current segment, PTS duration: ${ptsDuration ? (ptsDuration / 90000).toFixed(2) + 's (need 5.0s or 6000 packets)' : 'N/A (fallback: need 6000 packets)'}`);
           // Mark channel as broken BEFORE cleanup
           if (session.channelId) {
             markChannelBroken(session.channelId, 'timeout - no segments');

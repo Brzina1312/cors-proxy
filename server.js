@@ -646,6 +646,9 @@ async function startBuffering(session, token) {
   let totalPacketsExtracted = 0;
   let ptsFoundCount = 0;
   let lastProgressLog = Date.now();
+  let lastChunkReceived = Date.now();
+  let lastSegmentCreated = Date.now();
+  let chunkCount = 0;
   
   while (session.isBuffering && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
     try {
@@ -742,10 +745,25 @@ async function startBuffering(session, token) {
       
       // Track bytes received
       totalBytesReceived += chunk.length;
+      chunkCount++;
+      const timeSinceLastChunk = Date.now() - lastChunkReceived;
+      lastChunkReceived = Date.now();
       
       // Log first data received
       if (totalBytesReceived === chunk.length) {
         console.log(`[${new Date().toISOString()}] Buffering: First data received (${chunk.length} bytes)`);
+      }
+      
+      // Log chunks after first segment to diagnose stalled streams
+      if (session.segments && session.segments.length > 0 && chunkCount <= 20) {
+        console.log(`[${new Date().toISOString()}] Buffering: Chunk ${chunkCount} received (${chunk.length} bytes, ${timeSinceLastChunk}ms since last chunk)`);
+      }
+      
+      // Periodic logging for stalled streams (every 10s after first segment)
+      const timeSinceLastSegment = Date.now() - lastSegmentCreated;
+      if (session.segments && session.segments.length > 0 && timeSinceLastSegment > 10000 && Date.now() - lastProgressLog > 10000) {
+        console.log(`[${new Date().toISOString()}] Buffering STALLED: ${currentSegmentPackets.length} packets accumulated, ${timeSinceLastSegment}ms since last segment, waiting for 6000 packets or 5s PTS`);
+        lastProgressLog = Date.now();
       }
       
       // Add to packet buffer
@@ -816,6 +834,9 @@ async function startBuffering(session, token) {
           const oldestSeq = session.segments[0].seqNum;
           const newestSeq = segment.seqNum;
           console.log(`[${new Date().toISOString()}] Buffering: Segment ${segment.seqNum} created (${(segmentData.length/1024).toFixed(1)} KB, ${actualDuration.toFixed(2)}s, ${currentSegmentPackets.length} packets, buffer: ${session.segments.length} segments, range: ${oldestSeq}-${newestSeq})`);
+          
+          // Track segment creation time for stall detection
+          lastSegmentCreated = Date.now();
           
           // Real-time throttling: Track segment creation and throttle if too fast
           const now = Date.now();

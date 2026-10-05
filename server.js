@@ -689,12 +689,12 @@ async function startBuffering(session, token) {
             await new Promise(resolve => setTimeout(resolve, throttleDelay));
           }
           
-          // Keep only last 30 segments (2.5 minutes of buffer)
-          // Reduced from 90 to save memory: 30 segments = ~150MB for HD vs 90 = ~450MB
-          // This allows 3-4 concurrent HD users on 512MB RAM instead of just 1
-          if (session.segments.length > 30) {
+          // Keep only last 10 segments (~50 seconds of buffer)
+          // Optimized for memory: 10 segments × 4MB avg = ~40MB per stream (vs 30 segments = ~120MB)
+          // This allows 8-10 concurrent users on 512MB RAM with smooth playback
+          if (session.segments.length > 10) {
             const removed = session.segments.shift();
-            console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 30)`);
+            console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 10)`);
           }
           
           // Reset for next segment

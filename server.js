@@ -842,9 +842,17 @@ async function startBuffering(session, token) {
           // Optimized for memory: 10 segments × 4MB avg = ~40MB per stream (vs 30 segments = ~120MB)
           // This allows 8-10 concurrent users on 512MB RAM with smooth playback
           // Don't drop segments until playback has started (first segment served) to prevent "segment 0 not found" errors
+          // Only drop segments that are safely behind the player's current position (lastServedSegmentNum - 3)
           if (session.segments.length > 10 && session.playbackStarted) {
-            const removed = session.segments.shift();
-            console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 10)`);
+            const oldestSegment = session.segments[0];
+            const lastServed = session.lastServedSegmentNum || 0;
+            
+            // Only drop if the oldest segment is at least 3 positions behind the last served segment
+            // This keeps a safety buffer of segments the player might still need
+            if (oldestSegment.seqNum < lastServed - 3) {
+              const removed = session.segments.shift();
+              console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 10, lastServed: ${lastServed})`);
+            }
           }
           
           // Reset for next segment
@@ -1089,6 +1097,9 @@ app.get('/stream/:token/seg/:seqNum.ts', async (req, res) => {
       session.playbackStarted = true;
       console.log(`[${new Date().toISOString()}] Playback started for session (first segment served)`);
     }
+    
+    // Track the highest segment number served (player's current position)
+    session.lastServedSegmentNum = Math.max(session.lastServedSegmentNum || 0, seqNum);
     
     res.status(200);
     res.setHeader('Content-Type', 'video/mp2t');

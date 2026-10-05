@@ -500,6 +500,15 @@ function cleanupSession(token, reason = 'cleanup') {
   // Force garbage collection if available (helps release memory faster)
   if (global.gc) {
     global.gc();
+    
+    // Schedule a second delayed GC to catch heap fragmentation
+    // This helps RSS drop back down to baseline after streaming
+    setTimeout(() => {
+      if (global.gc && sessionNormalizers.size === 0) {
+        // Only run delayed GC if all sessions are closed
+        global.gc();
+      }
+    }, 2000);
   }
   
   // Log memory usage after cleanup for debugging
@@ -650,7 +659,8 @@ async function startBuffering(session, token) {
   let lastSegmentCreated = Date.now();
   let chunkCount = 0;
   
-  while (session.isBuffering && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+  try {
+    while (session.isBuffering && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
     try {
       // Connect to portal if needed
       if (!session.portalStream || !session.portalResponse) {
@@ -781,14 +791,17 @@ async function startBuffering(session, token) {
         
         // Extract PTS from normalized packet to track actual duration
         const pts = extractPTSFromPacket(normalizedPacket);
-        if (pts !== null) {
-          ptsFoundCount++;
-          lastPTS = pts;
-          if (segmentStartPTS === null) {
-            segmentStartPTS = pts;
-            console.log(`[${new Date().toISOString()}] Buffering: First PTS found (${pts}) after ${totalPacketsExtracted} packets`);
+          if (pts !== null) {
+            ptsFoundCount++;
+            lastPTS = pts;
+            if (segmentStartPTS === null) {
+              segmentStartPTS = pts;
+              // Reduced logging: only log for first segment
+              if (session.segments.length === 0) {
+                console.log(`[${new Date().toISOString()}] Buffering: First PTS found (${pts}) after ${totalPacketsExtracted} packets`);
+              }
+            }
           }
-        }
         
         // Progress logging every 5 seconds for NEW sessions with no segments yet
         const now = Date.now();
@@ -885,20 +898,49 @@ async function startBuffering(session, token) {
         }
       }
       
-    } catch (error) {
-      console.error(`[${new Date().toISOString()}] Buffering error:`, error.message);
-      session.portalStream = null;
-      session.portalResponse = null;
-      reconnectAttempts++;
-      
-      if (session.isBuffering) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
+      } catch (error) {
+        console.error(`[${new Date().toISOString()}] Buffering error:`, error.message);
+        session.portalStream = null;
+        session.portalResponse = null;
+        reconnectAttempts++;
+        
+        if (session.isBuffering) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
       }
     }
+  } finally {
+    // CRITICAL: Aggressively clean up local variables to help GC release memory
+    // These variables can hold 40-80MB of buffers during active streaming
+    console.log(`[${new Date().toISOString()}] Buffering stopped for session ${token.substring(0, 8)}`);
+    session.isBuffering = false;
+    
+    // Explicitly null out all buffer-holding variables
+    if (currentSegmentPackets && currentSegmentPackets.length > 0) {
+      for (let i = 0; i < currentSegmentPackets.length; i++) {
+        currentSegmentPackets[i] = null;
+      }
+      currentSegmentPackets.length = 0;
+    }
+    currentSegmentPackets = null;
+    packetBuffer = null;
+    segmentCreationTimes = null;
+    
+    // Force immediate GC to release memory
+    if (global.gc) {
+      global.gc();
+      
+      // Schedule a delayed GC to catch heap fragmentation from Buffer allocations
+      // Without this, RSS stays high (~160MB) even after streams close
+      setTimeout(() => {
+        if (global.gc) {
+          global.gc();
+          const memUsage = process.memoryUsage();
+          console.log(`[${new Date().toISOString()}] Delayed GC complete: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB heap, ${Math.round(memUsage.rss / 1024 / 1024)}MB RSS`);
+        }
+      }, 1000);
+    }
   }
-  
-  console.log(`[${new Date().toISOString()}] Buffering stopped for session ${token.substring(0, 8)}`);
-  session.isBuffering = false;
 }
 
 // ============================================

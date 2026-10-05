@@ -278,7 +278,7 @@ const sessionNormalizers = new Map(); // token -> {normalizer, segments, isBuffe
 const userStreamLimits = new Map(); // userId -> {activeStreams: Set, lastStreamStart: timestamp, 429Until: timestamp}
 const MAX_ACTIVE_STREAMS_PER_USER = 3; // Allow multiple devices per user
 const MIN_STREAM_START_INTERVAL = 2000; // 2 seconds between new streams
-const STREAM_START_TIMEOUT = 30000; // 30 seconds to create first segment or mark broken
+const STREAM_START_TIMEOUT = 15000; // 15 seconds to create first segment or mark broken
 
 // Protection: Per-MAC concurrent session blocking (one connection per MAC at a time)
 const activeMACStreams = new Map(); // macId -> {token, userId, startTime}
@@ -781,14 +781,14 @@ async function startBuffering(session, token) {
         }
         
         // Create segment when we have enough PTS duration (5 seconds = 450000 ticks at 90kHz)
-        // Or as fallback, use packet count for slow/sparse PTS streams
+        // Or as fallback, use packet count if no PTS available
         const ptsDuration = (lastPTS !== null && segmentStartPTS !== null) 
           ? (lastPTS - segmentStartPTS) 
           : null;
         
         const shouldFinalize = 
           (ptsDuration !== null && ptsDuration >= TARGET_SEGMENT_DURATION_PTS) ||
-          (currentSegmentPackets.length >= 6000); // Fallback when no PTS available (~1.1MB)
+          (ptsDuration === null && currentSegmentPackets.length >= 6000);
         
         if (shouldFinalize && currentSegmentPackets.length > 0) {
           const segmentData = Buffer.concat(currentSegmentPackets);
@@ -836,8 +836,7 @@ async function startBuffering(session, token) {
           // Keep only last 10 segments (~50 seconds of buffer)
           // Optimized for memory: 10 segments × 4MB avg = ~40MB per stream (vs 30 segments = ~120MB)
           // This allows 8-10 concurrent users on 512MB RAM with smooth playback
-          // Don't drop segments until playback has started (first segment served) to prevent "segment 0 not found" errors
-          if (session.segments.length > 10 && session.playbackStarted) {
+          if (session.segments.length > 10) {
             const removed = session.segments.shift();
             console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 10)`);
           }
@@ -854,7 +853,7 @@ async function startBuffering(session, token) {
             Date.now() - session.startTime > STREAM_START_TIMEOUT) {
           const ptsDuration = (lastPTS !== null && segmentStartPTS !== null) ? (lastPTS - segmentStartPTS) : null;
           console.error(`[${new Date().toISOString()}] Buffering: Stream failed to create segments within ${STREAM_START_TIMEOUT/1000}s, marking as broken`);
-          console.error(`[${new Date().toISOString()}] Buffering diagnostics: ${totalBytesReceived} bytes received, ${totalPacketsExtracted} packets extracted, ${ptsFoundCount} PTS found, ${currentSegmentPackets.length} packets in current segment, PTS duration: ${ptsDuration ? (ptsDuration / 90000).toFixed(2) + 's (need 5.0s or 6000 packets)' : 'N/A (fallback: need 6000 packets)'}`);
+          console.error(`[${new Date().toISOString()}] Buffering diagnostics: ${totalBytesReceived} bytes received, ${totalPacketsExtracted} packets extracted, ${ptsFoundCount} PTS found, ${currentSegmentPackets.length} packets in current segment, PTS duration: ${ptsDuration ? (ptsDuration / 90000).toFixed(2) + 's (need 5.0s)' : 'N/A (fallback: need 6000 packets)'}`);
           // Mark channel as broken BEFORE cleanup
           if (session.channelId) {
             markChannelBroken(session.channelId, 'timeout - no segments');
@@ -958,8 +957,7 @@ app.get('/stream/:token.m3u8', async (req, res) => {
         isBuffering: false,
         portalStream: null,
         portalResponse: null,
-        startTime: Date.now(), // Track when stream started for timeout detection
-        playbackStarted: false // Track if player has started consuming segments
+        startTime: Date.now() // Track when stream started for timeout detection
       };
       sessionNormalizers.set(token, session);
       
@@ -1078,15 +1076,6 @@ app.get('/stream/:token/seg/:seqNum.ts', async (req, res) => {
 
     // Serve buffered segment
     console.log(`[${new Date().toISOString()}] Serving segment ${seqNum} from buffer (${(segment.data.length/1024).toFixed(1)} KB)`);
-    
-    // Mark that playback has started (player is consuming segments)
-    if (!session.playbackStarted) {
-      session.playbackStarted = true;
-      console.log(`[${new Date().toISOString()}] Playback started for session (first segment served)`);
-    }
-    
-    // Track the highest segment number served (player's current position)
-    session.lastServedSegmentNum = Math.max(session.lastServedSegmentNum || 0, seqNum);
     
     res.status(200);
     res.setHeader('Content-Type', 'video/mp2t');

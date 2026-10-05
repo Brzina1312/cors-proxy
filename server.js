@@ -278,7 +278,7 @@ const sessionNormalizers = new Map(); // token -> {normalizer, segments, isBuffe
 const userStreamLimits = new Map(); // userId -> {activeStreams: Set, lastStreamStart: timestamp, 429Until: timestamp}
 const MAX_ACTIVE_STREAMS_PER_USER = 3; // Allow multiple devices per user
 const MIN_STREAM_START_INTERVAL = 2000; // 2 seconds between new streams
-const STREAM_START_TIMEOUT = 15000; // 15 seconds to create first segment or mark broken
+const STREAM_START_TIMEOUT = 30000; // 30 seconds to create first segment or mark broken (gives slow channels more time)
 
 // Protection: Per-MAC concurrent session blocking (one connection per MAC at a time)
 const activeMACStreams = new Map(); // macId -> {token, userId, startTime}

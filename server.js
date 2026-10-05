@@ -492,14 +492,14 @@ function cleanupSession(token, reason = 'cleanup') {
   console.log(`[${new Date().toISOString()}] Memory after cleanup: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB heap, ${sessionNormalizers.size} active sessions`);
 }
 
-// Cleanup inactive sessions every 3 seconds (faster cleanup = faster memory release)
+// Cleanup inactive sessions periodically
 setInterval(() => {
   const now = Date.now();
-  const INACTIVE_TIMEOUT = 5 * 1000; // 5 seconds (faster cleanup while maintaining channel switching logic)
+  const INACTIVE_TIMEOUT = 15 * 1000; // 15 seconds - 3x segment duration for HLS buffering, but fast enough for memory cleanup
   
   for (const [token, session] of sessionNormalizers.entries()) {
     if (now - session.lastAccess > INACTIVE_TIMEOUT) {
-      cleanupSession(token, 'inactive for 5s');
+      cleanupSession(token, 'inactive for 15s');
     }
   }
   
@@ -724,6 +724,12 @@ async function startBuffering(session, token) {
             duration: actualDuration
           };
           
+          // Safety check: if session was cleaned up while we were buffering, exit immediately
+          if (!session.segments || !session.isBuffering) {
+            console.log(`[${new Date().toISOString()}] Buffering: Session cleaned up, stopping buffering worker`);
+            break;
+          }
+          
           session.segments.push(segment);
           
           const oldestSeq = session.segments[0].seqNum;
@@ -760,7 +766,7 @@ async function startBuffering(session, token) {
         
         // Protection: Check for broken channel (no segments created within timeout)
         // Only applies to NEW sessions that are actively trying to buffer but failing
-        if (session.segments.length === 0 && session.startTime && 
+        if (session.segments && session.segments.length === 0 && session.startTime && 
             Date.now() - session.startTime > STREAM_START_TIMEOUT) {
           console.error(`[${new Date().toISOString()}] Buffering: Stream failed to create segments within ${STREAM_START_TIMEOUT/1000}s, marking as broken`);
           // Mark channel as broken BEFORE cleanup

@@ -641,6 +641,12 @@ async function startBuffering(session, token) {
   const THROTTLE_WINDOW = 30000; // 30 second window for rate calculation
   const MAX_SEGMENTS_PER_WINDOW = 12; // Max 12 segments in 30s (2x real-time for 5s segments)
   
+  // Diagnostics: Track buffering progress
+  let totalBytesReceived = 0;
+  let totalPacketsExtracted = 0;
+  let ptsFoundCount = 0;
+  let lastProgressLog = Date.now();
+  
   while (session.isBuffering && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
     try {
       // Connect to portal if needed
@@ -734,6 +740,14 @@ async function startBuffering(session, token) {
         break;
       }
       
+      // Track bytes received
+      totalBytesReceived += chunk.length;
+      
+      // Log first data received
+      if (totalBytesReceived === chunk.length) {
+        console.log(`[${new Date().toISOString()}] Buffering: First data received (${chunk.length} bytes)`);
+      }
+      
       // Add to packet buffer
       packetBuffer = Buffer.concat([packetBuffer, chunk]);
       
@@ -745,14 +759,25 @@ async function startBuffering(session, token) {
         // Normalize PTS/DTS
         const normalizedPacket = session.normalizer.normalizePacket(packet);
         currentSegmentPackets.push(normalizedPacket);
+        totalPacketsExtracted++;
         
         // Extract PTS from normalized packet to track actual duration
         const pts = extractPTSFromPacket(normalizedPacket);
         if (pts !== null) {
+          ptsFoundCount++;
           lastPTS = pts;
           if (segmentStartPTS === null) {
             segmentStartPTS = pts;
+            console.log(`[${new Date().toISOString()}] Buffering: First PTS found (${pts}) after ${totalPacketsExtracted} packets`);
           }
+        }
+        
+        // Progress logging every 5 seconds for NEW sessions with no segments yet
+        const now = Date.now();
+        if (session.segments && session.segments.length === 0 && now - lastProgressLog > 5000) {
+          const ptsDuration = (lastPTS !== null && segmentStartPTS !== null) ? (lastPTS - segmentStartPTS) : null;
+          console.log(`[${new Date().toISOString()}] Buffering progress: ${totalBytesReceived} bytes, ${totalPacketsExtracted} packets, ${ptsFoundCount} PTS found, ${currentSegmentPackets.length} in current segment, PTS duration: ${ptsDuration ? (ptsDuration / 90000).toFixed(2) + 's' : 'N/A'}`);
+          lastProgressLog = now;
         }
         
         // Create segment when we have enough PTS duration (5 seconds = 450000 ticks at 90kHz)
@@ -826,7 +851,9 @@ async function startBuffering(session, token) {
         // Only applies to NEW sessions that are actively trying to buffer but failing
         if (session.segments && session.segments.length === 0 && session.startTime && 
             Date.now() - session.startTime > STREAM_START_TIMEOUT) {
+          const ptsDuration = (lastPTS !== null && segmentStartPTS !== null) ? (lastPTS - segmentStartPTS) : null;
           console.error(`[${new Date().toISOString()}] Buffering: Stream failed to create segments within ${STREAM_START_TIMEOUT/1000}s, marking as broken`);
+          console.error(`[${new Date().toISOString()}] Buffering diagnostics: ${totalBytesReceived} bytes received, ${totalPacketsExtracted} packets extracted, ${ptsFoundCount} PTS found, ${currentSegmentPackets.length} packets in current segment, PTS duration: ${ptsDuration ? (ptsDuration / 90000).toFixed(2) + 's (need 5.0s)' : 'N/A (fallback: need 6000 packets)'}`);
           // Mark channel as broken BEFORE cleanup
           if (session.channelId) {
             markChannelBroken(session.channelId, 'timeout - no segments');

@@ -414,11 +414,11 @@ function cleanupSession(token, reason = 'cleanup') {
 // Cleanup inactive sessions every 5 seconds
 setInterval(() => {
   const now = Date.now();
-  const INACTIVE_TIMEOUT = 5 * 1000; // 5 seconds (reduced from 10s for faster channel switching)
+  const INACTIVE_TIMEOUT = 10 * 1000; // 10 seconds (balance between playback stability and channel switching)
   
   for (const [token, session] of sessionNormalizers.entries()) {
     if (now - session.lastAccess > INACTIVE_TIMEOUT) {
-      cleanupSession(token, 'inactive for 5s');
+      cleanupSession(token, 'inactive for 10s');
     }
   }
   

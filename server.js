@@ -740,6 +740,18 @@ app.get('/stream/:token.m3u8', async (req, res) => {
         return res.status(503).json({ error: 'Channel temporarily unavailable' });
       }
       
+      // Smart channel switching: instantly cleanup user's previous sessions
+      // When user clicks new channel, immediately close their old session for instant switching
+      const userLimits = userStreamLimits.get(payload.userId);
+      if (userLimits && userLimits.activeStreams && userLimits.activeStreams.size > 0) {
+        for (const oldToken of userLimits.activeStreams) {
+          if (oldToken !== token) { // Don't cleanup the current token
+            console.log(`[${new Date().toISOString()}] Smart cleanup: User switching channels, closing previous session ${oldToken.substring(0, 8)}`);
+            cleanupSession(oldToken, 'user switched channels');
+          }
+        }
+      }
+      
       session = {
         normalizer: new MPEGTSNormalizer(),
         lastAccess: Date.now(),

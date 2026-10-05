@@ -487,9 +487,14 @@ function cleanupSession(token, reason = 'cleanup') {
   // Delete session (remaining references will be garbage collected)
   sessionNormalizers.delete(token);
   
+  // Force garbage collection if available (helps release memory faster)
+  if (global.gc) {
+    global.gc();
+  }
+  
   // Log memory usage after cleanup for debugging
   const memUsage = process.memoryUsage();
-  console.log(`[${new Date().toISOString()}] Memory after cleanup: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB heap, ${sessionNormalizers.size} active sessions`);
+  console.log(`[${new Date().toISOString()}] Memory after cleanup: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB heap, ${Math.round(memUsage.rss / 1024 / 1024)}MB RSS, ${sessionNormalizers.size} active sessions`);
 }
 
 // Cleanup inactive sessions periodically
@@ -529,6 +534,18 @@ setInterval(() => {
       activeMACStreams.delete(macId);
       console.log(`[${new Date().toISOString()}] Cleaned up stale MAC entry: ${macId}`);
     }
+  }
+  
+  // Cleanup expired brokenChannels entries
+  for (const [channelId, blockedUntil] of brokenChannels.entries()) {
+    if (now >= blockedUntil) {
+      brokenChannels.delete(channelId);
+    }
+  }
+  
+  // Force garbage collection if available to release memory faster
+  if (global.gc) {
+    global.gc();
   }
 }, 5000); // Run every 5 seconds for faster channel switching
 

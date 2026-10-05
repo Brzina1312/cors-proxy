@@ -426,6 +426,16 @@ function cleanupSession(token, reason = 'cleanup') {
   // Stop buffering worker FIRST
   session.isBuffering = false;
   
+  // Abort the fetch connection to forcefully stop data flow
+  if (session.abortController) {
+    try {
+      session.abortController.abort();
+    } catch (e) {
+      // Ignore errors
+    }
+    session.abortController = null;
+  }
+  
   // Aggressively destroy portal connection and streams
   if (session.portalResponse) {
     try {
@@ -602,6 +612,10 @@ async function startBuffering(session, token) {
   session.isBuffering = true;
   console.log(`[${new Date().toISOString()}] Starting background buffering for session ${token.substring(0, 8)}...`);
   
+  // Create AbortController to forcefully stop fetch
+  const abortController = new AbortController();
+  session.abortController = abortController;
+  
   let packetBuffer = Buffer.alloc(0);
   let currentSegmentPackets = [];
   let segmentStartPTS = null; // Track PTS at start of segment
@@ -626,8 +640,15 @@ async function startBuffering(session, token) {
             'User-Agent': 'StreamNexus-Proxy/1.0',
             'Connection': 'keep-alive'
           },
-          timeout: 30000
+          timeout: 30000,
+          signal: abortController.signal
         });
+        
+        // Check immediately after await - session might have been cleaned up
+        if (!session.isBuffering) {
+          console.log(`[${new Date().toISOString()}] Buffering stopped during fetch for session ${token.substring(0, 8)}`);
+          break;
+        }
         
         if (!portalResponse.ok) {
           console.error(`[${new Date().toISOString()}] Buffering: Portal error ${portalResponse.status}`);
@@ -652,12 +673,16 @@ async function startBuffering(session, token) {
             console.warn(`[${new Date().toISOString()}] Buffering: Error 407 (auth/connection issue), exponential backoff ${backoffDelay}ms (attempt ${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})`);
             reconnectAttempts++;
             await new Promise(resolve => setTimeout(resolve, backoffDelay));
+            // Check after await
+            if (!session.isBuffering) break;
             continue;
           }
           
           // Other errors: use standard retry delay
           reconnectAttempts++;
           await new Promise(resolve => setTimeout(resolve, 2000));
+          // Check after await
+          if (!session.isBuffering) break;
           continue;
         }
         
@@ -675,13 +700,15 @@ async function startBuffering(session, token) {
         session.portalResponse = null;
         reconnectAttempts++;
         await new Promise(resolve => setTimeout(resolve, 100));
+        // Check after await
+        if (!session.isBuffering) break;
         continue;
       }
       
       // Reset reconnect counter on successful read
       reconnectAttempts = 0;
       
-      // Check if session was stopped by cleanup
+      // Check if session was stopped by cleanup - CRITICAL: check immediately after receiving data
       if (!session.isBuffering) {
         console.log(`[${new Date().toISOString()}] Buffering stopped for session ${token.substring(0, 8)}`);
         break;
@@ -765,6 +792,8 @@ async function startBuffering(session, token) {
             const throttleDelay = 2500; // 2.5 second delay to slow down
             console.log(`[${new Date().toISOString()}] Buffering: Rate too fast (${segmentCreationTimes.length} segments in ${THROTTLE_WINDOW/1000}s), throttling ${throttleDelay}ms`);
             await new Promise(resolve => setTimeout(resolve, throttleDelay));
+            // Check after await - session might have been cleaned up during throttle delay
+            if (!session.isBuffering) break;
           }
           
           // Keep only last 10 segments (~50 seconds of buffer)

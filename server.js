@@ -506,16 +506,25 @@ function cleanupSession(token, reason = 'cleanup') {
   
   // Force garbage collection if available (helps release memory faster)
   if (global.gc) {
+    // Run 4 GC passes with staggered timing to aggressively compact heap
+    // This helps reduce RSS after large buffer allocations (3+ MB segments)
     global.gc();
     
-    // Schedule a second delayed GC to catch heap fragmentation
-    // This helps RSS drop back down to baseline after streaming
     setTimeout(() => {
       if (global.gc && sessionNormalizers.size === 0) {
-        // Only run delayed GC if all sessions are closed
-        global.gc();
+        global.gc(); // 2nd pass at 1s
+        setTimeout(() => {
+          if (global.gc && sessionNormalizers.size === 0) {
+            global.gc(); // 3rd pass at 3s
+            setTimeout(() => {
+              if (global.gc && sessionNormalizers.size === 0) {
+                global.gc(); // 4th pass at 6s
+              }
+            }, 3000);
+          }
+        }, 2000);
       }
-    }, 2000);
+    }, 1000);
   }
   
   // Log memory usage after cleanup for debugging
@@ -882,12 +891,17 @@ async function startBuffering(session, token) {
             if (!session.isBuffering) break;
           }
           
-          // Keep only last 10 segments (~50 seconds of buffer)
-          // Optimized for memory: 10 segments × 4MB avg = ~40MB per stream (vs 30 segments = ~120MB)
-          // This allows 8-10 concurrent users on 512MB RAM with smooth playback
-          if (session.segments.length > 10) {
+          // Keep only last 5 segments (~25 seconds of buffer)
+          // Reduced from 10 to minimize memory fragmentation and RSS retention
+          // 5 segments × 3.3MB avg = ~16.5MB per stream (vs 10 segments = ~33MB)
+          // 25s buffer is still plenty for HLS seeking and prevents high water mark issue
+          if (session.segments.length > 5) {
             const removed = session.segments.shift();
-            console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 10)`);
+            // Explicitly clear buffer data to help GC reclaim memory immediately
+            if (removed && removed.data) {
+              removed.data = null;
+            }
+            console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 5)`);
           }
           
           // Reset for next segment

@@ -455,11 +455,18 @@ function cleanupSession(token, reason = 'cleanup') {
   // Clear portal stream if exists
   if (session.portalStream) {
     try {
+      // Properly close async iterator by calling return() method
+      // This signals the iterator to clean up internal state and buffers
+      // Don't await - cleanupSession is synchronous, but return() will still trigger cleanup
+      if (typeof session.portalStream.return === 'function') {
+        session.portalStream.return().catch(() => {});
+      }
+      // Also try destroy() as fallback for streams that support it
       if (typeof session.portalStream.destroy === 'function') {
         session.portalStream.destroy();
       }
     } catch (e) {
-      // Ignore errors
+      // Ignore errors during cleanup
     }
     session.portalStream = null;
   }
@@ -727,6 +734,14 @@ async function startBuffering(session, token) {
       
       if (done) {
         console.log(`[${new Date().toISOString()}] Buffering: Portal disconnected, reconnecting...`);
+        // Properly close iterator before nulling
+        if (session.portalStream && typeof session.portalStream.return === 'function') {
+          try {
+            await session.portalStream.return();
+          } catch (e) {
+            // Ignore errors during cleanup
+          }
+        }
         session.portalStream = null;
         session.portalResponse = null;
         reconnectAttempts++;
@@ -900,6 +915,14 @@ async function startBuffering(session, token) {
       
       } catch (error) {
         console.error(`[${new Date().toISOString()}] Buffering error:`, error.message);
+        // Properly close iterator before nulling on error
+        if (session.portalStream && typeof session.portalStream.return === 'function') {
+          try {
+            await session.portalStream.return();
+          } catch (e) {
+            // Ignore errors during cleanup
+          }
+        }
         session.portalStream = null;
         session.portalResponse = null;
         reconnectAttempts++;

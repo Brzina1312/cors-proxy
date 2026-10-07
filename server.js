@@ -8,7 +8,7 @@ const JWT_SECRET = process.env.JWT_SECRET;
 
 // Rate limiting: Track requests per user
 const userRequestTracker = new Map();
-const USER_REQUEST_LIMIT = 10;
+const USER_REQUEST_LIMIT = 50;
 const USER_REQUEST_WINDOW = 10000;
 
 // Request queue for short requests ONLY (not streaming)

@@ -580,38 +580,39 @@ setInterval(() => {
   
   // AGGRESSIVE MEMORY MANAGEMENT: Force GC periodically to release memory back to OS
   // This helps prevent the "high water mark" issue where RSS stays at peak usage
-  if (global.gc) {
-    global.gc();
-    
-    // Log memory stats every minute for monitoring
-    const memUsage = process.memoryUsage();
-    const heapMB = Math.round(memUsage.heapUsed / 1024 / 1024);
-    const rssMB = Math.round(memUsage.rss / 1024 / 1024);
-    const externalMB = Math.round(memUsage.external / 1024 / 1024);
-    
-    // Always log memory stats when sessions are active
-    if (rssMB > 100 || sessionNormalizers.size > 0) {
-      console.log(`[${new Date().toISOString()}] Memory stats: ${heapMB}MB heap, ${rssMB}MB RSS, ${externalMB}MB external, ${sessionNormalizers.size} active sessions`);
-    }
-    
-    // RSS threshold: trigger aggressive GC and trim buffers if memory is getting high
-    // Render free tier has 512MB, paid has 1GB - stay well under to prevent OOM kills
-    const RSS_THRESHOLD_MB = 400;
-    if (rssMB > RSS_THRESHOLD_MB) {
-      console.warn(`[${new Date().toISOString()}] RSS ${rssMB}MB exceeds threshold ${RSS_THRESHOLD_MB}MB, trimming buffers`);
-      global.gc();
-      for (const [tkn, sess] of sessionNormalizers.entries()) {
-        if (sess.segments && sess.segments.length > 4) {
-          const before = sess.segments.length;
-          while (sess.segments.length > 4) {
-            const removed = sess.segments.shift();
-            if (removed && removed.data) removed.data = null;
-          }
-          sess.playlistCache = null; // Invalidate playlist cache after trim
-          console.log(`[${new Date().toISOString()}] Memory pressure: Trimmed session ${tkn.substring(0, 8)} from ${before} to ${sess.segments.length} segments`);
+  // Always run memory checks - moved outside gc block
+  const memUsage = process.memoryUsage();
+  const heapMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+  const rssMB = Math.round(memUsage.rss / 1024 / 1024);
+  const externalMB = Math.round(memUsage.external / 1024 / 1024);
+  
+  // Always log memory stats when sessions are active
+  if (rssMB > 100 || sessionNormalizers.size > 0) {
+    console.log(`[${new Date().toISOString()}] Memory stats: ${heapMB}MB heap, ${rssMB}MB RSS, ${externalMB}MB external, ${sessionNormalizers.size} active sessions`);
+  }
+  
+  // RSS threshold: trigger aggressive GC and trim buffers if memory is getting high
+  // Render free tier has 512MB, paid has 1GB - stay well under to prevent OOM kills
+  const RSS_THRESHOLD_MB = 400;
+  if (rssMB > RSS_THRESHOLD_MB) {
+    console.warn(`[${new Date().toISOString()}] RSS ${rssMB}MB exceeds threshold ${RSS_THRESHOLD_MB}MB, trimming buffers`);
+    // Trim buffers regardless of GC availability
+    for (const [tkn, sess] of sessionNormalizers.entries()) {
+      if (sess.segments && sess.segments.length > 4) {
+        const before = sess.segments.length;
+        while (sess.segments.length > 4) {
+          const removed = sess.segments.shift();
+          if (removed && removed.data) removed.data = null;
         }
+        sess.playlistCache = null; // Invalidate playlist cache after trim
+        console.log(`[${new Date().toISOString()}] Memory pressure: Trimmed session ${tkn.substring(0, 8)} from ${before} to ${sess.segments.length} segments`);
       }
     }
+  }
+  
+  // Only run GC when sessions are active (optimization)
+  if (global.gc && sessionNormalizers.size > 0) {
+    global.gc();
   }
 }, 5000); // Run every 5 seconds for faster channel switching
 
@@ -977,6 +978,11 @@ async function startBuffering(session, token) {
         session.portalStream = null;
         session.portalResponse = null;
         reconnectAttempts++;
+        
+        // Clear segment buffer on error to prevent memory accumulation
+        if (currentSegmentPackets && currentSegmentPackets.length > 0) {
+          currentSegmentPackets = [];
+        }
         
         if (session.isBuffering) {
           await new Promise(resolve => setTimeout(resolve, 2000));

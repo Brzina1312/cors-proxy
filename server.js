@@ -546,6 +546,10 @@ setInterval(() => {
   // Cleanup old user limit entries (no active streams and last activity > 10 min)
   for (const [userId, limits] of userStreamLimits.entries()) {
     if (limits.activeStreams.size === 0 && now - limits.lastStreamStart > 10 * 60 * 1000) {
+      // Clear the Set object before deletion to help GC
+      if (limits.activeStreams) {
+        limits.activeStreams.clear();
+      }
       userStreamLimits.delete(userId);
     }
   }

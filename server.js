@@ -589,9 +589,28 @@ setInterval(() => {
     const rssMB = Math.round(memUsage.rss / 1024 / 1024);
     const externalMB = Math.round(memUsage.external / 1024 / 1024);
     
-    // Only log if we have memory worth reporting
+    // Always log memory stats when sessions are active
     if (rssMB > 100 || sessionNormalizers.size > 0) {
       console.log(`[${new Date().toISOString()}] Memory stats: ${heapMB}MB heap, ${rssMB}MB RSS, ${externalMB}MB external, ${sessionNormalizers.size} active sessions`);
+    }
+    
+    // RSS threshold: trigger aggressive GC and trim buffers if memory is getting high
+    // Render free tier has 512MB, paid has 1GB - stay well under to prevent OOM kills
+    const RSS_THRESHOLD_MB = 400;
+    if (rssMB > RSS_THRESHOLD_MB) {
+      console.warn(`[${new Date().toISOString()}] RSS ${rssMB}MB exceeds threshold ${RSS_THRESHOLD_MB}MB, trimming buffers`);
+      global.gc();
+      for (const [tkn, sess] of sessionNormalizers.entries()) {
+        if (sess.segments && sess.segments.length > 4) {
+          const before = sess.segments.length;
+          while (sess.segments.length > 4) {
+            const removed = sess.segments.shift();
+            if (removed && removed.data) removed.data = null;
+          }
+          sess.playlistCache = null; // Invalidate playlist cache after trim
+          console.log(`[${new Date().toISOString()}] Memory pressure: Trimmed session ${tkn.substring(0, 8)} from ${before} to ${sess.segments.length} segments`);
+        }
+      }
     }
   }
 }, 5000); // Run every 5 seconds for faster channel switching
@@ -725,9 +744,13 @@ async function startBuffering(session, token) {
             continue;
           }
           
-          // Other errors: use standard retry delay
+          // Other errors: exponential backoff with jitter to prevent thundering herd
           reconnectAttempts++;
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          const baseDelay = Math.min(2000 * Math.pow(1.5, reconnectAttempts - 1), 30000);
+          const jitter = Math.random() * 1000;
+          const retryDelay = Math.round(baseDelay + jitter);
+          console.warn(`[${new Date().toISOString()}] Buffering: Error ${portalResponse.status}, backoff ${retryDelay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+          await new Promise(resolve => setTimeout(resolve, retryDelay));
           // Check after await
           if (!session.isBuffering) break;
           continue;
@@ -868,6 +891,9 @@ async function startBuffering(session, token) {
           
           session.segments.push(segment);
           
+          // Invalidate playlist cache so next request gets the new segment
+          session.playlistCache = null;
+          
           const oldestSeq = session.segments[0].seqNum;
           const newestSeq = segment.seqNum;
           console.log(`[${new Date().toISOString()}] Buffering: Segment ${segment.seqNum} created (${(segmentData.length/1024).toFixed(1)} KB, ${actualDuration.toFixed(2)}s, ${currentSegmentPackets.length} packets, buffer: ${session.segments.length} segments, range: ${oldestSeq}-${newestSeq})`);
@@ -891,17 +917,28 @@ async function startBuffering(session, token) {
             if (!session.isBuffering) break;
           }
           
-          // Keep only last 5 segments (~25 seconds of buffer)
-          // Reduced from 10 to minimize memory fragmentation and RSS retention
-          // 5 segments × 3.3MB avg = ~16.5MB per stream (vs 10 segments = ~33MB)
-          // 25s buffer is still plenty for HLS seeking and prevents high water mark issue
-          if (session.segments.length > 5) {
-            const removed = session.segments.shift();
-            // Explicitly clear buffer data to help GC reclaim memory immediately
-            if (removed && removed.data) {
-              removed.data = null;
+          // Playback-aware buffer management
+          // Instead of blindly dropping the oldest segment, track what the client has fetched
+          // This prevents "Segment 0 not found" errors where ExoPlayer requests segments
+          // that were dropped before the client could fetch them
+          const MAX_BUFFER_SEGMENTS = 8; // Hard cap (8 × ~3.3MB = ~26MB per session)
+          const KEEP_BEHIND = 1; // Keep 1 segment behind client's position for backward seeks
+          
+          while (session.segments.length > MAX_BUFFER_SEGMENTS) {
+            const oldest = session.segments[0];
+            const clientPos = session.lastServedSeqNum || -1;
+            
+            if (clientPos >= 0 && oldest.seqNum <= clientPos - KEEP_BEHIND) {
+              // Safe to drop: client has already fetched this segment
+              const removed = session.segments.shift();
+              if (removed && removed.data) removed.data = null;
+              console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (client at ${clientPos}, behind by ${clientPos - removed.seqNum})`);
+            } else {
+              // Client hasn't caught up yet, but we're at hard cap - drop oldest as last resort
+              const removed = session.segments.shift();
+              if (removed && removed.data) removed.data = null;
+              console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (hard cap ${MAX_BUFFER_SEGMENTS}, client at ${clientPos})`);
             }
-            console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (keeping last 5)`);
           }
           
           // Reset for next segment
@@ -1057,7 +1094,10 @@ app.get('/stream/:token.m3u8', async (req, res) => {
         isBuffering: false,
         portalStream: null,
         portalResponse: null,
-        startTime: Date.now() // Track when stream started for timeout detection
+        startTime: Date.now(), // Track when stream started for timeout detection
+        lastServedSeqNum: -1, // Highest segment number served to client (for buffer management)
+        playlistCache: null,  // Cached HLS playlist string
+        playlistCacheTime: 0  // Timestamp of cached playlist
       };
       sessionNormalizers.set(token, session);
       
@@ -1075,6 +1115,17 @@ app.get('/stream/:token.m3u8', async (req, res) => {
       startBuffering(session, token);
     } else {
       session.lastAccess = Date.now();
+    }
+
+    // Check playlist cache (reduces regeneration on rapid HLS refreshes)
+    // ExoPlayer refreshes every 3-5s; caching for 2s cuts requests by ~50%
+    const PLAYLIST_CACHE_TTL = 2000; // 2 seconds
+    if (session.playlistCache && Date.now() - session.playlistCacheTime < PLAYLIST_CACHE_TTL && session.segments.length > 0) {
+      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      console.log(`[${new Date().toISOString()}] HLS Playlist sent (cached): ${session.segments.length} segments`);
+      return res.send(session.playlistCache);
     }
 
     // Generate playlist from actually buffered segments
@@ -1111,6 +1162,10 @@ app.get('/stream/:token.m3u8', async (req, res) => {
     }
     
     const playlist = lines.join('\n');
+    
+    // Cache the generated playlist (invalidated when new segments are created)
+    session.playlistCache = playlist;
+    session.playlistCacheTime = Date.now();
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -1162,6 +1217,9 @@ app.get('/stream/:token/seg/:seqNum.ts', async (req, res) => {
     }
     
     session.lastAccess = Date.now();
+    // Track playback position for intelligent buffer management
+    // Buffer only drops segments the client has already fetched
+    session.lastServedSeqNum = Math.max(session.lastServedSeqNum || -1, seqNum);
 
     // Find segment in buffer
     const segment = session.segments.find(s => s.seqNum === seqNum);

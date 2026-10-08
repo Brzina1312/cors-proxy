@@ -926,12 +926,18 @@ async function startBuffering(session, token) {
           // Instead of blindly dropping the oldest segment, track what the client has fetched
           // This prevents "Segment 0 not found" errors where ExoPlayer requests segments
           // that were dropped before the client could fetch them
-          const MAX_BUFFER_SEGMENTS = 8; // Hard cap (8 × ~3.3MB = ~26MB per session)
+          const MAX_BUFFER_SEGMENTS = 8; // Normal buffer cap (8 × ~3.3MB = ~26MB per session)
+          const INITIAL_BUFFER_SEGMENTS = 12; // Allow more buffering before playback starts (prevents 00:15 start issue)
           const KEEP_BEHIND = 1; // Keep 1 segment behind client's position for backward seeks
           
-          while (session.segments.length > MAX_BUFFER_SEGMENTS) {
+          // Use larger buffer until player starts fetching to prevent dropping initial segments
+          // Fast-buffering streams (SD quality) can create 8+ segments before player requests manifest
+          // If we drop segment 0-2 early, player starts at 00:15 instead of 00:00
+          const clientPos = session.lastServedSeqNum || -1;
+          const maxBufferSize = clientPos < 0 ? INITIAL_BUFFER_SEGMENTS : MAX_BUFFER_SEGMENTS;
+          
+          while (session.segments.length > maxBufferSize) {
             const oldest = session.segments[0];
-            const clientPos = session.lastServedSeqNum || -1;
             
             if (clientPos >= 0 && oldest.seqNum <= clientPos - KEEP_BEHIND) {
               // Safe to drop: client has already fetched this segment
@@ -942,7 +948,7 @@ async function startBuffering(session, token) {
               // Client hasn't caught up yet, but we're at hard cap - drop oldest as last resort
               const removed = session.segments.shift();
               if (removed && removed.data) removed.data = null;
-              console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (hard cap ${MAX_BUFFER_SEGMENTS}, client at ${clientPos})`);
+              console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (hard cap ${maxBufferSize}, client at ${clientPos})`);
             }
           }
           

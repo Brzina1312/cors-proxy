@@ -1063,14 +1063,46 @@ app.get('/stream/:token.m3u8', async (req, res) => {
       }
       
       // Protection: Check if MAC is already streaming (one connection per MAC)
+      // BUT allow instant channel switching for same user if old session is inactive
       if (payload.macId) {
         const macStatus = isMACAlreadyStreaming(payload.macId);
         if (macStatus.inUse) {
-          console.warn(`[${new Date().toISOString()}] MAC ${payload.macId} already streaming for user ${macStatus.userId}`);
-          return res.status(409).json({ 
-            error: 'Active connection detected',
-            message: 'This subscription is already being used on another device. Only one device can stream at a time per subscription.'
-          });
+          // Check if it's the SAME user trying to switch channels
+          if (macStatus.userId === payload.userId) {
+            // Same user - check if old session is inactive (instant channel switching)
+            const activeStream = activeMACStreams.get(payload.macId);
+            const oldSession = activeStream ? sessionNormalizers.get(activeStream.token) : null;
+            
+            if (oldSession) {
+              const timeSinceLastAccess = Date.now() - oldSession.lastAccess;
+              const INACTIVE_THRESHOLD = 3000; // 3 seconds
+              
+              if (timeSinceLastAccess > INACTIVE_THRESHOLD) {
+                // Old session inactive - allow instant channel switching
+                console.log(`[${new Date().toISOString()}] MAC ${payload.macId}: Same user ${payload.userId} switching channels - old session inactive (${Math.round(timeSinceLastAccess/1000)}s), forcing cleanup`);
+                cleanupSession(activeStream.token, 'instant channel switch - inactive session');
+                // Continue to create new session
+              } else {
+                // Old session still active - this is a concurrent streaming attempt
+                console.warn(`[${new Date().toISOString()}] MAC ${payload.macId}: Same user ${payload.userId} tried concurrent stream - old session active (${Math.round(timeSinceLastAccess/1000)}s ago), blocking`);
+                return res.status(409).json({ 
+                  error: 'Stream still active',
+                  message: 'Your previous stream is still active. Please wait a few seconds and try again.'
+                });
+              }
+            } else {
+              // Session not found but MAC registered - cleanup and allow
+              console.log(`[${new Date().toISOString()}] MAC ${payload.macId}: Session not found but MAC registered - cleaning up`);
+              activeMACStreams.delete(payload.macId);
+            }
+          } else {
+            // Different user - block concurrent device
+            console.warn(`[${new Date().toISOString()}] MAC ${payload.macId} already streaming for different user ${macStatus.userId}, requested by ${payload.userId}`);
+            return res.status(409).json({ 
+              error: 'Active connection detected',
+              message: 'This subscription is already being used on another device. Only one device can stream at a time per subscription.'
+            });
+          }
         }
       }
       

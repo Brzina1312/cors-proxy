@@ -1522,6 +1522,47 @@ app.get('/stream/:token', async (req, res) => {
   }
 });
 
+// ============================================
+// Active Sessions Endpoint (for Worker cleanup cron)
+// ============================================
+// Returns list of active streaming sessions for database sync
+app.get('/api/active-sessions', (req, res) => {
+  try {
+    const now = Date.now();
+    const activeSessions = [];
+    
+    // Iterate through all active sessions
+    for (const [token, session] of sessionNormalizers.entries()) {
+      // Only include sessions that are still alive (activity within last 90 seconds)
+      const inactiveDuration = now - session.lastAccess;
+      if (inactiveDuration < 90000) {
+        activeSessions.push({
+          token: token.substring(0, 16) + '...', // Truncate for privacy in logs
+          tokenFull: token, // Full token for database lookup
+          userId: session.userId,
+          channelId: session.channelId,
+          lastAccess: session.lastAccess,
+          startTime: session.startTime,
+          inactiveSeconds: Math.round(inactiveDuration / 1000),
+          segmentCount: session.segments.length,
+          isBuffering: session.isBuffering
+        });
+      }
+    }
+    
+    console.log(`[${new Date().toISOString()}] Active sessions report: ${activeSessions.length} sessions`);
+    
+    res.json({
+      timestamp: now,
+      count: activeSessions.length,
+      sessions: activeSessions
+    });
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] Active sessions endpoint error:`, error.message);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`CORS proxy with improved HLS running on port ${PORT}`);
   console.log(`JWT_SECRET configured: ${!!JWT_SECRET}`);

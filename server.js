@@ -705,6 +705,9 @@ async function startBuffering(session, token) {
       // Connect to portal if needed
       if (!session.portalStream || !session.portalResponse) {
         console.log(`[${new Date().toISOString()}] Buffering: Connecting to portal...`);
+        console.log(`[${new Date().toISOString()}] DEBUG: Stream URL: ${session.streamUrl}`);
+        console.log(`[${new Date().toISOString()}] DEBUG: User-Agent: Lavf/58.29.100`);
+        console.log(`[${new Date().toISOString()}] DEBUG: UserId: ${session.userId}, ChannelId: ${session.channelId}`);
         
         const portalResponse = await fetch(session.streamUrl, {
           headers: {
@@ -723,6 +726,9 @@ async function startBuffering(session, token) {
         
         if (!portalResponse.ok) {
           console.error(`[${new Date().toISOString()}] Buffering: Portal error ${portalResponse.status}`);
+          console.error(`[${new Date().toISOString()}] DEBUG ERROR: URL: ${session.streamUrl}`);
+          console.error(`[${new Date().toISOString()}] DEBUG ERROR: Status: ${portalResponse.status} ${portalResponse.statusText}`);
+          console.error(`[${new Date().toISOString()}] DEBUG ERROR: Response headers:`, JSON.stringify(Object.fromEntries(portalResponse.headers)));
           
           // Handle 429 (Too Many Requests) - user-specific cooldown
           if (portalResponse.status === 429 && session.userId) {
@@ -1157,7 +1163,11 @@ app.get('/stream/:token.m3u8', async (req, res) => {
         registerMACStream(payload.macId, token, payload.userId);
       }
       
-      console.log(`[${new Date().toISOString()}] New session created for user ${payload.userId}, channel ${payload.channelId}`);
+      console.log(`[${new Date().toISOString()}] DEBUG SESSION: New session created`);
+      console.log(`[${new Date().toISOString()}] DEBUG SESSION: UserId: ${payload.userId}`);
+      console.log(`[${new Date().toISOString()}] DEBUG SESSION: ChannelId: ${payload.channelId}`);
+      console.log(`[${new Date().toISOString()}] DEBUG SESSION: MacId: ${payload.macId}`);
+      console.log(`[${new Date().toISOString()}] DEBUG SESSION: StreamUrl: ${payload.streamUrl}`);
       
       // Start background buffering
       startBuffering(session, token);

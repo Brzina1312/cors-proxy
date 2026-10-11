@@ -754,7 +754,7 @@ async function startBuffering(session, token) {
             session.consecutiveFailures++;
             session.lastErrorCode = portalResponse.status;
             
-            const BACKUP_MAC_THRESHOLD = 5; // Try backup MAC after 5 consecutive failures
+            const BACKUP_MAC_THRESHOLD = 2; // Try backup MAC after 2 consecutive failures (faster response)
             
             if (session.consecutiveFailures >= BACKUP_MAC_THRESHOLD && !session.backupMacAssigned) {
               console.log(`[${new Date().toISOString()}] 🔥 Persistent ${portalResponse.status} errors detected (${session.consecutiveFailures} attempts), requesting backup MAC`);

@@ -105,6 +105,88 @@ app.get('/check-mac/:macId', (req, res) => {
   });
 });
 
+// Simple proxy endpoint for M3U streams
+// Accepts X-Target-URL header (new) or url query param (legacy)
+app.get('/proxy', async (req, res) => {
+  try {
+    // Get target URL from header (new M3U handler) or query param (legacy)
+    const targetUrl = req.headers['x-target-url'] || req.query.url;
+    
+    if (!targetUrl) {
+      return res.status(400).json({ error: 'Missing target URL (X-Target-URL header or url query param)' });
+    }
+
+    // Validate URL is from allowed domain
+    const allowedDomain = 'vpn.streamhut.xyz';
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(targetUrl);
+    } catch (e) {
+      return res.status(400).json({ error: 'Invalid URL format' });
+    }
+    
+    if (parsedUrl.hostname !== allowedDomain) {
+      return res.status(403).json({ error: 'Domain not allowed' });
+    }
+
+    console.log(`[${new Date().toISOString()}] /proxy: Proxying to ${targetUrl.substring(0, 80)}...`);
+
+    // Queue the request to prevent rate limiting (portal returns 429)
+    // Spaces requests by at least 200ms
+    const response = await queueRequest(targetUrl, {
+      'User-Agent': 'Lavf/58.29.100',
+      ...(req.headers.range ? { 'Range': req.headers.range } : {})
+    });
+
+    if (!response.ok) {
+      console.error(`[${new Date().toISOString()}] /proxy: Portal error ${response.status} ${response.statusText}`);
+      return res.status(response.status).json({ 
+        error: `Upstream error: ${response.status} ${response.statusText}` 
+      });
+    }
+
+    // Log successful response details
+    console.log(`[${new Date().toISOString()}] /proxy: Success ${response.status}, Content-Type: ${response.headers.get('content-type') || 'none'}`);
+
+    // Copy relevant headers
+    res.status(response.status);
+    
+    const contentType = response.headers.get('content-type');
+    if (contentType) {
+      res.setHeader('Content-Type', contentType);
+    } else {
+      res.setHeader('Content-Type', 'video/mp2t');
+    }
+
+    const contentLength = response.headers.get('content-length');
+    if (contentLength) {
+      res.setHeader('Content-Length', contentLength);
+    }
+
+    const contentRange = response.headers.get('content-range');
+    if (contentRange) {
+      res.setHeader('Content-Range', contentRange);
+    }
+
+    const acceptRanges = response.headers.get('accept-ranges');
+    if (acceptRanges) {
+      res.setHeader('Accept-Ranges', acceptRanges);
+    }
+
+    // Cache for 5 minutes
+    res.setHeader('Cache-Control', 'public, max-age=300');
+
+    // Stream the response
+    response.body.pipe(res);
+
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] /proxy: Error:`, error.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Proxy error', details: error.message });
+    }
+  }
+});
+
 // Process request queue
 async function processQueue() {
   if (isProcessingQueue || requestQueue.length === 0) {

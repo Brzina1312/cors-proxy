@@ -749,6 +749,82 @@ async function startBuffering(session, token) {
             continue;
           }
           
+          // Handle 456/458 (Authorization/Stream Unavailable) - try backup MAC after threshold
+          if ((portalResponse.status === 456 || portalResponse.status === 458) && session.userId && session.channelId) {
+            session.consecutiveFailures++;
+            session.lastErrorCode = portalResponse.status;
+            
+            const BACKUP_MAC_THRESHOLD = 5; // Try backup MAC after 5 consecutive failures
+            
+            if (session.consecutiveFailures >= BACKUP_MAC_THRESHOLD && !session.backupMacAssigned) {
+              console.log(`[${new Date().toISOString()}] 🔥 Persistent ${portalResponse.status} errors detected (${session.consecutiveFailures} attempts), requesting backup MAC`);
+              
+              try {
+                const apiUrl = process.env.API_URL || 'https://api.streamnexus.workers.dev';
+                const backupResponse = await fetch(`${apiUrl}/api/streaming-failure`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json'
+                  },
+                  body: JSON.stringify({
+                    userId: session.userId,
+                    channelId: session.channelId,
+                    errorCode: portalResponse.status.toString(),
+                    attemptCount: session.consecutiveFailures
+                  }),
+                  timeout: 10000
+                });
+                
+                if (backupResponse.ok) {
+                  const backupData = await backupResponse.json();
+                  
+                  if (backupData.success && backupData.streamUrl) {
+                    console.log(`[${new Date().toISOString()}] ✅ Backup MAC assigned successfully: ${backupData.backupMac?.macAddress}`);
+                    
+                    // Update session with new stream URL
+                    session.streamUrl = backupData.streamUrl;
+                    session.backupMacAssigned = true;
+                    session.consecutiveFailures = 0;
+                    
+                    // Reset connection to use new URL
+                    if (session.portalStream && typeof session.portalStream.return === 'function') {
+                      try {
+                        await session.portalStream.return();
+                      } catch (e) {
+                        // Ignore cleanup errors
+                      }
+                    }
+                    session.portalStream = null;
+                    session.portalResponse = null;
+                    
+                    console.log(`[${new Date().toISOString()}] 🔄 Retrying with backup MAC...`);
+                    continue; // Retry immediately with new URL
+                  } else if (backupData.alreadyOnBackup) {
+                    console.warn(`[${new Date().toISOString()}] User already on backup MAC, cannot assign another`);
+                    session.backupMacAssigned = true; // Prevent further attempts
+                  } else if (backupData.noBackupAvailable) {
+                    console.error(`[${new Date().toISOString()}] No backup MAC available`);
+                    session.backupMacAssigned = true; // Prevent further attempts
+                  }
+                } else {
+                  console.error(`[${new Date().toISOString()}] Backup MAC request failed: ${backupResponse.status}`);
+                }
+              } catch (backupError) {
+                console.error(`[${new Date().toISOString()}] Error requesting backup MAC:`, backupError.message);
+              }
+            }
+            
+            // Continue with normal retry (exponential backoff)
+            reconnectAttempts++;
+            const baseDelay = Math.min(2000 * Math.pow(1.5, reconnectAttempts - 1), 30000);
+            const jitter = Math.random() * 1000;
+            const retryDelay = Math.round(baseDelay + jitter);
+            console.warn(`[${new Date().toISOString()}] Buffering: Error ${portalResponse.status}, backoff ${retryDelay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+            await new Promise(resolve => setTimeout(resolve, retryDelay));
+            if (!session.isBuffering) break;
+            continue;
+          }
+          
           // Other errors: exponential backoff with jitter to prevent thundering herd
           reconnectAttempts++;
           const baseDelay = Math.min(2000 * Math.pow(1.5, reconnectAttempts - 1), 30000);
@@ -790,6 +866,8 @@ async function startBuffering(session, token) {
       
       // Reset reconnect counter on successful read
       reconnectAttempts = 0;
+      session.consecutiveFailures = 0; // Reset failure counter on successful data
+      session.lastErrorCode = null;
       
       // Check if session was stopped by cleanup - CRITICAL: check immediately after receiving data
       if (!session.isBuffering) {
@@ -1145,7 +1223,10 @@ app.get('/stream/:token.m3u8', async (req, res) => {
         startTime: Date.now(), // Track when stream started for timeout detection
         lastServedSeqNum: -1, // Highest segment number served to client (for buffer management)
         playlistCache: null,  // Cached HLS playlist string
-        playlistCacheTime: 0  // Timestamp of cached playlist
+        playlistCacheTime: 0,  // Timestamp of cached playlist
+        consecutiveFailures: 0, // Track consecutive 456/458 errors for backup MAC
+        lastErrorCode: null, // Last error code received
+        backupMacAssigned: false // Flag to prevent multiple backup assignments
       };
       sessionNormalizers.set(token, session);
       

@@ -708,7 +708,7 @@ async function startBuffering(session, token) {
         
         const portalResponse = await fetch(session.streamUrl, {
           headers: {
-            'User-Agent': 'StreamNexus-Proxy/1.0',
+            'User-Agent': 'Lavf/58.29.100',
             'Connection': 'keep-alive'
           },
           timeout: 30000,

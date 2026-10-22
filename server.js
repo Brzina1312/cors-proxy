@@ -5,6 +5,10 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
+// Hard cap on concurrent HLS sessions - protects small hosts (512 MB RAM):
+// every session buffers HLS segments in memory, so caps must match the
+// worker-side pool config (proxy_endpoints.max_sessions)
+const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS, 10) || 48;
 
 // Rate limiting: Track requests per user
 const userRequestTracker = new Map();
@@ -31,8 +35,15 @@ app.use((req, res, next) => {
 });
 
 // Health check
+// sessions/maxSessions let the worker load balancer track per-box load
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    sessions: sessionNormalizers.size,
+    maxSessions: MAX_SESSIONS,
+    uptime: process.uptime()
+  });
 });
 
 // MAC status check endpoint - used by worker to check if MAC is already streaming
@@ -1067,6 +1078,15 @@ app.get('/stream/:token.m3u8', async (req, res) => {
     // Get or create session for this token
     let session = sessionNormalizers.get(token);
     if (!session) {
+      // Hard session-cap protection (RAM guard for small hosts)
+      if (sessionNormalizers.size >= MAX_SESSIONS) {
+        console.warn(`[${new Date().toISOString()}] REJECTED: session capacity reached (${sessionNormalizers.size}/${MAX_SESSIONS})`);
+        return res.status(503).json({
+          error: 'Server at capacity',
+          message: 'This streaming server is at its maximum concurrent session limit. Please try again in a moment.'
+        });
+      }
+
       // Protection: Check if user can start new stream
       const canStart = canUserStartStream(payload.userId);
       if (!canStart.allowed) {
@@ -1614,4 +1634,5 @@ app.get('/api/active-sessions', (req, res) => {
 app.listen(PORT, () => {
   console.log(`CORS proxy with improved HLS running on port ${PORT}`);
   console.log(`JWT_SECRET configured: ${!!JWT_SECRET}`);
+  console.log(`MAX_SESSIONS: ${MAX_SESSIONS}`);
 });

@@ -807,6 +807,19 @@ async function startBuffering(session, token) {
             continue;
           }
           
+          // Handle 458 (stream slot occupied for this MAC) - happens right
+          // after a channel switch while the portal releases the MAC's old
+          // stream (~5-8s). Fast fixed-interval retries so the new stream
+          // grabs the slot the moment it frees (no growing backoff).
+          if (portalResponse.status === 458) {
+            reconnectAttempts++;
+            const fastDelay = 600 + Math.floor(Math.random() * 400); // 600-1000ms
+            console.warn(`[${new Date().toISOString()}] Buffering: Error 458 (portal slot busy for MAC), fast retry ${fastDelay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+            await new Promise(resolve => setTimeout(resolve, fastDelay));
+            if (!session.isBuffering) break;
+            continue;
+          }
+
           // Other errors: exponential backoff with jitter to prevent thundering herd
           reconnectAttempts++;
           const baseDelay = Math.min(2000 * Math.pow(1.5, reconnectAttempts - 1), 30000);
@@ -1252,12 +1265,15 @@ app.get('/stream/:token.m3u8', async (req, res) => {
     const SEGMENT_DURATION = 5; // seconds
     
     // Wait briefly for initial segments if buffer is empty
+    // Up to 12s: on channel switches, the portal needs ~5-8s to release the
+    // MAC's old stream slot (458) - waiting here lets the player's FIRST
+    // playlist request come back WITH segments instead of the 503 retry loop
     if (session.segments.length === 0) {
       console.log(`[${new Date().toISOString()}] Waiting for initial segments...`);
-      // Wait up to 3 seconds for first segments
-      for (let i = 0; i < 30; i++) {
-        if (session.segments.length >= 3) break;
-        await new Promise(resolve => setTimeout(resolve, 100));
+      const waitStart = Date.now();
+      const WAIT_WINDOW = 12000; // up to 12s total
+      while (session.segments.length < 3 && Date.now() - waitStart < WAIT_WINDOW && session.isBuffering) {
+        await new Promise(resolve => setTimeout(resolve, 250));
       }
     }
     

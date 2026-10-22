@@ -1,10 +1,25 @@
 const express = require('express');
 const fetch = require('node-fetch');
 const jwt = require('jsonwebtoken');
+const fs = require('fs');
+const path = require('path');
 const app = express();
 
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET;
+// JWT secret resolution order: 1) env var, 2) jwt_secret.txt next to this
+// file (file manager upload - works on hosts where panel variables fail)
+function loadSecretFile(name) {
+  try {
+    const p = path.join(__dirname, name);
+    if (fs.existsSync(p)) {
+      const value = fs.readFileSync(p, 'utf8').trim();
+      if (value && value.length >= 10) return value;
+      console.warn(`[${new Date().toISOString()}] ${name} exists but is too short / empty`);
+    }
+  } catch (e) { /* ignore read errors */ }
+  return null;
+}
+const JWT_SECRET = process.env.JWT_SECRET || loadSecretFile('jwt_secret.txt');
 // Hard cap on concurrent HLS sessions - protects small hosts (512 MB RAM):
 // every session buffers HLS segments in memory, so caps must match the
 // worker-side pool config (proxy_endpoints.max_sessions)
@@ -1633,6 +1648,6 @@ app.get('/api/active-sessions', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`CORS proxy with improved HLS running on port ${PORT}`);
-  console.log(`JWT_SECRET configured: ${!!JWT_SECRET}`);
+  console.log(`JWT_SECRET configured: ${!!JWT_SECRET} (source: ${JWT_SECRET ? (process.env.JWT_SECRET ? 'env' : 'jwt_secret.txt') : 'MISSING'})`);
   console.log(`MAX_SESSIONS: ${MAX_SESSIONS}`);
 });

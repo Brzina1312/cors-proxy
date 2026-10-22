@@ -6,8 +6,33 @@ const path = require('path');
 const app = express();
 
 const PORT = process.env.PORT || 3000;
-// JWT secret resolution order: 1) env var, 2) jwt_secret.txt next to this
-// file (file manager upload - works on hosts where panel variables fail)
+// Secrets/config resolution order: 1) real env vars, 2) .env file next to
+// this file (dotenv-style key=value, no dependencies), 3) jwt_secret.txt
+// (legacy fallback). Only missing env vars are taken from .env - real
+// environment always wins.
+function parseEnvFile(name) {
+  const out = {};
+  try {
+    const p = path.join(__dirname, name);
+    if (fs.existsSync(p)) {
+      for (const rawLine of fs.readFileSync(p, 'utf8').split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#')) continue;
+        const eq = line.indexOf('=');
+        if (eq <= 0) continue;
+        const key = line.slice(0, eq).trim();
+        let value = line.slice(eq + 1).trim();
+        if ((value.startsWith('"') && value.endsWith('"')) ||
+            (value.startsWith("'") && value.endsWith("'"))) {
+          value = value.slice(1, -1);
+        }
+        if (key) out[key] = value;
+      }
+    }
+  } catch (e) { /* ignore parse/read errors */ }
+  return out;
+}
+
 function loadSecretFile(name) {
   try {
     const p = path.join(__dirname, name);
@@ -19,11 +44,12 @@ function loadSecretFile(name) {
   } catch (e) { /* ignore read errors */ }
   return null;
 }
-const JWT_SECRET = process.env.JWT_SECRET || loadSecretFile('jwt_secret.txt');
-// Hard cap on concurrent HLS sessions - protects small hosts (512 MB RAM):
-// every session buffers HLS segments in memory, so caps must match the
-// worker-side pool config (proxy_endpoints.max_sessions)
-const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS, 10) || 48;
+const dotenv = parseEnvFile('.env');
+const JWT_SECRET = process.env.JWT_SECRET || dotenv.JWT_SECRET || loadSecretFile('jwt_secret.txt');
+// Hard cap on concurrent HLS sessions - protects small hosts (512 MB RAM,
+// weak CPU ~20% load per active stream): default 10 per box, override in
+// .env or env; must match worker-side proxy_endpoints.max_sessions
+const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || dotenv.MAX_SESSIONS, 10) || 10;
 
 // Rate limiting: Track requests per user
 const userRequestTracker = new Map();
@@ -1648,6 +1674,6 @@ app.get('/api/active-sessions', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`CORS proxy with improved HLS running on port ${PORT}`);
-  console.log(`JWT_SECRET configured: ${!!JWT_SECRET} (source: ${JWT_SECRET ? (process.env.JWT_SECRET ? 'env' : 'jwt_secret.txt') : 'MISSING'})`);
+  console.log(`JWT_SECRET configured: ${!!JWT_SECRET} (source: ${JWT_SECRET ? (process.env.JWT_SECRET ? 'env' : (dotenv.JWT_SECRET ? '.env' : 'jwt_secret.txt')) : 'MISSING'})`);
   console.log(`MAX_SESSIONS: ${MAX_SESSIONS}`);
 });

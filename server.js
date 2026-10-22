@@ -1632,6 +1632,43 @@ app.get('/stream/:token', async (req, res) => {
 });
 
 // ============================================
+// Worker-Directed Session Cleanup (cross-box channel switching)
+// ============================================
+// The worker load balancer calls this BEFORE issuing a new play token for a
+// user whose old session lives on THIS box: without it, the portal keeps
+// serving the old stream for the MAC (only 1 stream per MAC is allowed) and
+// the new stream hits 458 until the real inactivity timer runs out.
+// Auth: the caller must present the full session token (JWT) itself - it
+// cannot be forged without the shared secret, and it only ever cleans the
+// session it references.
+app.post('/cleanup/:token', (req, res) => {
+  const { token } = req.params;
+  if (!token || !JWT_SECRET) {
+    return res.status(400).json({ error: 'Missing token or JWT secret' });
+  }
+  let payload;
+  try {
+    payload = jwt.verify(token, JWT_SECRET);
+  } catch (jwtError) {
+    console.error(`[${new Date().toISOString()}] Invalid JWT for cleanup:`, jwtError.message);
+    return res.status(403).json({ error: 'Invalid token' });
+  }
+  // Optional strictness: ?userId= must match the token's user
+  const requestUserId = req.query.userId;
+  if (requestUserId && payload.userId && requestUserId !== payload.userId) {
+    console.warn(`[${new Date().toISOString()}] Cleanup refused: user mismatch (${requestUserId} vs token user ${payload.userId})`);
+    return res.status(403).json({ error: 'User mismatch' });
+  }
+  const session = sessionNormalizers.get(token);
+  if (!session) {
+    return res.json({ cleaned: false, reason: 'not_found' });
+  }
+  console.log(`[${new Date().toISOString()}] Worker-directed cleanup: user=${payload.userId} ch=${session.channelId}`);
+  cleanupSession(token, 'worker-directed cleanup (channel switch)');
+  res.json({ cleaned: true });
+});
+
+// ============================================
 // Active Sessions Endpoint (for Worker cleanup cron)
 // ============================================
 // Returns list of active streaming sessions for database sync

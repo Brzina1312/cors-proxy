@@ -51,6 +51,9 @@ const JWT_SECRET = process.env.JWT_SECRET || dotenv.JWT_SECRET || loadSecretFile
 // .env or env; must match worker-side proxy_endpoints.max_sessions
 const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || dotenv.MAX_SESSIONS, 10) || 10;
 
+// Worker origin for failover reporting (456/458 during buffering)
+const WORKER_URL = (process.env.WORKER_URL || dotenv.WORKER_URL || 'https://api.streamnexus.cc.cd').replace(/\/+$/, '');
+
 // Rate limiting: Track requests per user
 const userRequestTracker = new Map();
 const USER_REQUEST_LIMIT = 50;
@@ -719,6 +722,54 @@ function extractPTSFromPacket(packet) {
   }
 }
 
+// Report a persistent 456/458 from buffering to the worker failover endpoint.
+// Returns 'wait' | 'switched' | 'error'. On 'switched' the session keeps
+// streaming with a new portal URL (backup MAC) - the client never notices.
+async function reportFailureToWorker(session) {
+  if (!session.userId) return 'error';
+  try {
+    const res = await fetch(`${WORKER_URL}/api/streaming-failure`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: session.userId,
+        channelId: String(session.channelId || ''),
+        errorCode: '458',
+        attemptCount: 8
+      }),
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!res.ok) {
+      console.error(`[${new Date().toISOString()}] Failover report rejected: HTTP ${res.status}`);
+      return 'error';
+    }
+    const data = await res.json();
+    if (data.wait) {
+      console.log(`[${new Date().toISOString()}] Failover report: portal wind-down detected, keep retrying (${data.waitSeconds || 12}s)`);
+      return 'wait';
+    }
+    if (data.success && data.streamUrl) {
+      const parsed = new URL(data.streamUrl);
+      if (parsed.hostname !== 'vpn.streamhut.xyz') {
+        console.error(`[${new Date().toISOString()}] Failover stream URL has unexpected host`);
+        return 'error';
+      }
+      console.log(`[${new Date().toISOString()}] Failover: worker assigned backup MAC - switching session stream URL`);
+      session.streamUrl = data.streamUrl;
+      session.portalStream = null;
+      session.portalResponse = null;
+      if (session.macId && data.backupMac && data.backupMac.id) {
+        session.macId = data.backupMac.id;
+      }
+      return 'switched';
+    }
+    return 'error';
+  } catch (e) {
+    console.error(`[${new Date().toISOString()}] Failover report failed: ${e.message}`);
+    return 'error';
+  }
+}
+
 async function startBuffering(session, token) {
   if (session.isBuffering) return;
   
@@ -815,6 +866,21 @@ async function startBuffering(session, token) {
             reconnectAttempts++;
             const fastDelay = 600 + Math.floor(Math.random() * 400); // 600-1000ms
             console.warn(`[${new Date().toISOString()}] Buffering: Error 458 (portal slot busy for MAC), fast retry ${fastDelay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+
+            // First ~8s of fast retries cover the portal's own wind-down.
+            // Past that, report to the worker each round: it classifies
+            // switch-lag vs real occupation and can re-point the session at a
+            // backup MAC. Player must still be polling (session alive).
+            if (reconnectAttempts % 8 === 0 && Date.now() - session.lastAccess < 15000) {
+              const action = await reportFailureToWorker(session);
+              if (action === 'switched') {
+                reconnectAttempts = 0; // fresh portal URL: reset attempts
+                if (!session.isBuffering) break;
+                continue; // portalStream/portalResponse already nulled -> fresh connect
+              }
+              // 'wait' or 'error': keep the fast retry loop from above
+            }
+
             await new Promise(resolve => setTimeout(resolve, fastDelay));
             if (!session.isBuffering) break;
             continue;

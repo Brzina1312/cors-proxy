@@ -772,7 +772,10 @@ function extractPTSFromPacket(packet) {
 // Report a persistent 456/458 from buffering to the worker failover endpoint.
 // Returns 'wait' | 'switched' | 'error'. On 'switched' the session keeps
 // streaming with a new portal URL (backup MAC) - the client never notices.
-async function reportFailureToWorker(session) {
+// hard458: 458 has been continuous for >=12s with zero successful reads -
+// portal wind-down cannot last that long, so the worker must not answer
+// "wait" (switch-lag) or repeated channel zaps would keep the session stuck.
+async function reportFailureToWorker(session, hard458 = false) {
   if (!session.userId) return 'error';
   try {
     const res = await fetch(`${WORKER_URL}/api/streaming-failure`, {
@@ -782,7 +785,9 @@ async function reportFailureToWorker(session) {
         userId: session.userId,
         channelId: String(session.channelId || ''),
         errorCode: '458',
-        attemptCount: 8
+        attemptCount: 8,
+        continuousSeconds: hard458 ? Math.round((Date.now() - session.first458At) / 1000) : 0,
+        hard458
       }),
       signal: AbortSignal.timeout(8000)
     });
@@ -930,17 +935,26 @@ async function startBuffering(session, token) {
           // grabs the slot the moment it frees (no growing backoff).
           if (portalResponse.status === 458) {
             reconnectAttempts++;
+            if (!session.first458At) session.first458At = Date.now();
+            const hard458 = (Date.now() - session.first458At) >= 12000; // wind-down never lasts this long
             const fastDelay = 600 + Math.floor(Math.random() * 400); // 600-1000ms
-            console.warn(`[${new Date().toISOString()}] Buffering: Error 458 (portal slot busy for MAC), fast retry ${fastDelay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+            console.warn(`[${new Date().toISOString()}] Buffering: Error 458 (portal slot busy for MAC), fast retry ${fastDelay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}${hard458 ? ', CONTINUOUS>12s - cannot be switch lag' : ''})`);
 
             // First ~8s of fast retries cover the portal's own wind-down.
             // Past that, report to the worker each round: it classifies
             // switch-lag vs real occupation and can re-point the session at a
             // backup MAC. Player must still be polling (session alive).
+            // hard458 tells the worker the 458 has been continuous for >12s,
+            // which portal wind-down alone cannot produce - it must be a real
+            // occupation (box in use outside our service), so the worker must
+            // fail over instead of answering "wait" again. Without this,
+            // repeated channel zaps keep renewing the takeover-marker rows and
+            // the worker waits forever.
             if (reconnectAttempts % 8 === 0 && Date.now() - session.lastAccess < 15000) {
-              const action = await reportFailureToWorker(session);
+              const action = await reportFailureToWorker(session, hard458);
               if (action === 'switched') {
                 reconnectAttempts = 0; // fresh portal URL: reset attempts
+                session.first458At = null; // new URL gets its own lag window
                 if (!session.isBuffering) break;
                 continue; // portalStream/portalResponse already nulled -> fresh connect
               }
@@ -993,6 +1007,9 @@ async function startBuffering(session, token) {
       
       // Reset reconnect counter on successful read
       reconnectAttempts = 0;
+      // Healthy read ends any running 458 streak - the next 458 starts a
+      // fresh continuous-failure window
+      session.first458At = null;
       
       // Check if session was stopped by cleanup - CRITICAL: check immediately after receiving data
       if (!session.isBuffering) {
@@ -1349,6 +1366,7 @@ app.get('/stream/:token.m3u8', async (req, res) => {
         portalResponse: null,
         startTime: Date.now(), // Track when stream started for timeout detection
         lastServedSeqNum: -1, // Highest segment number served to client (for buffer management)
+        first458At: null, // Start of the current continuous-458 streak (for hard458 failover signal)
         bufferedBytes: 0, // Live bytes held in segments[] (per-session buffer accounting)
         segmentBytesTotal: 0, // All segment bytes produced (for bitrate measurement)
         segmentDurationTotal: 0, // All segment seconds produced (for bitrate measurement)

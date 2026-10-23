@@ -335,6 +335,18 @@ const MAX_ACTIVE_STREAMS_PER_USER = 3; // Allow multiple devices per user
 const MIN_STREAM_START_INTERVAL = 2000; // 2 seconds between new streams
 const STREAM_START_TIMEOUT = 30000; // 30 seconds to create first segment or mark broken (gives slow channels more time)
 
+// Playback buffer management (env-overridable so a bigger box later is an env change, not code)
+// Design: window DEPTH is the invariant (seconds of content held), bytes are the guardrail.
+// RAM per user = windowSeconds x measured mux bitrate -> SD automatically gets a deep
+// window, 4K gets a shorter one, and no single user can exceed the per-session cap.
+const SESSION_WINDOW_TARGET_S = parseInt(process.env.BUFFER_WINDOW_S || '45', 10);
+const SESSION_FLOOR_BYTES = parseInt(process.env.BUFFER_FLOOR_MB || '12', 10) * 1024 * 1024;
+const SESSION_HARD_CAP_BYTES = parseInt(process.env.BUFFER_CAP_MB || '64', 10) * 1024 * 1024;
+const GLOBAL_BUFFER_BYTES = parseInt(process.env.GLOBAL_BUFFER_MB || '224', 10) * 1024 * 1024;
+const SEGMENT_MAX_AGE_MS = parseInt(process.env.BUFFER_MAX_AGE_MS || '100000', 10);
+const KEEP_BEHIND = 2; // segments of rewind history kept behind the player's position
+let globalBufferedBytes = 0; // total segment bytes held across all live sessions
+
 // Protection: Per-MAC concurrent session blocking (one connection per MAC at a time)
 const activeMACStreams = new Map(); // macId -> {token, userId, startTime}
 
@@ -471,6 +483,31 @@ function unregisterActiveStream(userId, token) {
   }
 }
 
+// Compute this session's buffer byte budget from its measured mux bitrate:
+// clamp(windowTarget x bitrate, FLOOR, min(HARD_CAP, fair share of the global pool)).
+// Bitrate is only trusted once ~10s of segments exist; before that the hard cap
+// applies (safe: fast fill of the initial buffer, backpressure + max-age bound it).
+function computeSessionBudget(session, activeCount) {
+  let budget = SESSION_HARD_CAP_BYTES;
+  const durTotal = session.segmentDurationTotal || 0;
+  const bytesTotal = session.segmentBytesTotal || 0;
+  if (durTotal > 10 && bytesTotal > 0) {
+    budget = Math.round((bytesTotal / durTotal) * SESSION_WINDOW_TARGET_S);
+  }
+  budget = Math.max(SESSION_FLOOR_BYTES, Math.min(budget, SESSION_HARD_CAP_BYTES));
+  const n = Math.max(1, activeCount || 1);
+  const fairShare = Math.floor(GLOBAL_BUFFER_BYTES / n * 1.5);
+  return Math.min(budget, Math.max(SESSION_FLOOR_BYTES, fairShare));
+}
+
+function countBufferingSessions() {
+  let n = 0;
+  for (const s of sessionNormalizers.values()) {
+    if (s.isBuffering) n++;
+  }
+  return n;
+}
+
 // Immediately clean up a session (called on errors, disconnects, etc.)
 function cleanupSession(token, reason = 'cleanup') {
   const session = sessionNormalizers.get(token);
@@ -542,6 +579,8 @@ function cleanupSession(token, reason = 'cleanup') {
     session.segments.length = 0;
     session.segments = null;
   }
+  // Release this session's bytes from the global pool accounting
+  globalBufferedBytes = Math.max(0, globalBufferedBytes - (session.bufferedBytes || 0));
   
   // Unregister from user's active streams
   if (session.userId) {
@@ -647,7 +686,7 @@ setInterval(() => {
   
   // Always log memory stats when sessions are active
   if (rssMB > 100 || sessionNormalizers.size > 0) {
-    console.log(`[${new Date().toISOString()}] Memory stats: ${heapMB}MB heap, ${rssMB}MB RSS, ${externalMB}MB external, ${sessionNormalizers.size} active sessions`);
+    console.log(`[${new Date().toISOString()}] Memory stats: ${heapMB}MB heap, ${rssMB}MB RSS, ${externalMB}MB external, ${sessionNormalizers.size} active sessions, segment buffers ${(globalBufferedBytes / 1048576).toFixed(1)}MB (pool cap ${Math.round(GLOBAL_BUFFER_BYTES / 1048576)}MB)`);
   }
   
   // RSS threshold: trigger aggressive GC and trim buffers if memory is getting high
@@ -659,12 +698,20 @@ setInterval(() => {
     for (const [tkn, sess] of sessionNormalizers.entries()) {
       if (sess.segments && sess.segments.length > 4) {
         const before = sess.segments.length;
+        let freed = 0;
         while (sess.segments.length > 4) {
           const removed = sess.segments.shift();
-          if (removed && removed.data) removed.data = null;
+          if (removed && removed.data) {
+            freed += removed.data.length;
+            removed.data = null;
+          }
         }
+        // Emergency backstop only. Normal operation never reaches this because
+        // the byte-budget allocator + backpressure keep us under threshold.
+        sess.bufferedBytes = Math.max(0, (sess.bufferedBytes || 0) - freed);
+        globalBufferedBytes = Math.max(0, globalBufferedBytes - freed);
         sess.playlistCache = null; // Invalidate playlist cache after trim
-        console.log(`[${new Date().toISOString()}] Memory pressure: Trimmed session ${tkn.substring(0, 8)} from ${before} to ${sess.segments.length} segments`);
+        console.log(`[${new Date().toISOString()}] Memory pressure: Trimmed session ${tkn.substring(0, 8)} from ${before} to ${sess.segments.length} segments, freed ${(freed / 1048576).toFixed(1)}MB`);
       }
     }
   }
@@ -788,11 +835,6 @@ async function startBuffering(session, token) {
   const MAX_RECONNECT_ATTEMPTS = 100;
   const TARGET_SEGMENT_DURATION_PTS = 450000; // 5 seconds in 90kHz PTS units
   
-  // Real-time throttling: Track segment creation rate
-  let segmentCreationTimes = []; // Array of timestamps when segments were created
-  const THROTTLE_WINDOW = 30000; // 30 second window for rate calculation
-  const MAX_SEGMENTS_PER_WINDOW = 12; // Max 12 segments in 30s (2x real-time for 5s segments)
-  
   // Diagnostics: Track buffering progress
   let totalBytesReceived = 0;
   let totalPacketsExtracted = 0;
@@ -801,10 +843,34 @@ async function startBuffering(session, token) {
   let lastChunkReceived = Date.now();
   let lastSegmentCreated = Date.now();
   let chunkCount = 0;
-  
+  let bpLogging = false; // avoid spamming backpressure logs
+
   try {
     while (session.isBuffering && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
     try {
+      // Backpressure: if the buffer is still over budget after eviction,
+      // stop pulling from the portal for a beat. TCP backpressure slows
+      // production naturally instead of dropping data the player needs.
+      const bpOver = session.segments && session.segments.length > 0 &&
+        (session.bufferedBytes || 0) > computeSessionBudget(session, countBufferingSessions());
+      if (bpOver) {
+        if (!bpLogging) {
+          bpLogging = true;
+          console.log(`[${new Date().toISOString()}] Buffering: Backpressure ON (${((session.bufferedBytes || 0) / 1048576).toFixed(1)}MB > budget ${Math.round(computeSessionBudget(session, countBufferingSessions()) / 1048576)}MB, ${session.segments.length} segs), pausing portal reads`);
+        }
+        // Client gone while paused? Free the session.
+        if (Date.now() - session.lastAccess > 15000) {
+          cleanupSession(token, 'client disconnected (backpressure pause)');
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 250));
+        if (!session.isBuffering) break;
+        continue;
+      } else if (bpLogging) {
+        bpLogging = false;
+        console.log(`[${new Date().toISOString()}] Buffering: Backpressure OFF (${((session.bufferedBytes || 0) / 1048576).toFixed(1)}MB, ${session.segments.length} segs), resuming portal reads`);
+      }
+
       // Connect to portal if needed
       if (!session.portalStream || !session.portalResponse) {
         console.log(`[${new Date().toISOString()}] Buffering: Connecting to portal...`);
@@ -1042,51 +1108,45 @@ async function startBuffering(session, token) {
           
           // Track segment creation time for stall detection
           lastSegmentCreated = Date.now();
-          
-          // Real-time throttling: Track segment creation and throttle if too fast
-          const now = Date.now();
-          segmentCreationTimes.push(now);
-          
-          // Remove old timestamps outside the window
-          segmentCreationTimes = segmentCreationTimes.filter(t => now - t < THROTTLE_WINDOW);
-          
-          // If creating segments too fast (>2x real-time), throttle
-          if (segmentCreationTimes.length > MAX_SEGMENTS_PER_WINDOW) {
-            const throttleDelay = 2500; // 2.5 second delay to slow down
-            console.log(`[${new Date().toISOString()}] Buffering: Rate too fast (${segmentCreationTimes.length} segments in ${THROTTLE_WINDOW/1000}s), throttling ${throttleDelay}ms`);
-            await new Promise(resolve => setTimeout(resolve, throttleDelay));
-            // Check after await - session might have been cleaned up during throttle delay
-            if (!session.isBuffering) break;
-          }
-          
-          // Playback-aware buffer management
-          // Instead of blindly dropping the oldest segment, track what the client has fetched
-          // This prevents "Segment 0 not found" errors where ExoPlayer requests segments
-          // that were dropped before the client could fetch them
-          const MAX_BUFFER_SEGMENTS = 8; // Normal buffer cap (8 × ~3.3MB = ~26MB per session)
-          const INITIAL_BUFFER_SEGMENTS = 12; // Allow more buffering before playback starts (prevents 00:15 start issue)
-          const KEEP_BEHIND = 1; // Keep 1 segment behind client's position for backward seeks
-          
-          // Use larger buffer until player starts fetching to prevent dropping initial segments
-          // Fast-buffering streams (SD quality) can create 8+ segments before player requests manifest
-          // If we drop segment 0-2 early, player starts at 00:15 instead of 00:00
-          const clientPos = session.lastServedSeqNum || -1;
-          const maxBufferSize = clientPos < 0 ? INITIAL_BUFFER_SEGMENTS : MAX_BUFFER_SEGMENTS;
-          
-          while (session.segments.length > maxBufferSize) {
+
+          // Byte accounting for buffer management (global + per-session)
+          session.bufferedBytes = (session.bufferedBytes || 0) + segmentData.length;
+          session.segmentBytesTotal = (session.segmentBytesTotal || 0) + segmentData.length;
+          session.segmentDurationTotal = (session.segmentDurationTotal || 0) + actualDuration;
+          globalBufferedBytes += segmentData.length;
+
+          // Playback-aware buffer management: a segment is ONLY dropped when
+          // the client has already fetched it (or it aged out). Dropping a
+          // segment the player still needs caused the 404 -> infinite stall
+          // loop on weak connections and slow provider channels.
+          const clientPos = session.lastServedSeqNum ?? -1;
+          const activeCount = countBufferingSessions();
+          const budget = computeSessionBudget(session, activeCount);
+          let droppedBehind = 0, droppedAged = 0, droppedPressure = 0;
+          while (session.segments.length > 0) {
             const oldest = session.segments[0];
-            
+            let reason = null;
             if (clientPos >= 0 && oldest.seqNum <= clientPos - KEEP_BEHIND) {
-              // Safe to drop: client has already fetched this segment
-              const removed = session.segments.shift();
-              if (removed && removed.data) removed.data = null;
-              console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (client at ${clientPos}, behind by ${clientPos - removed.seqNum})`);
+              reason = 'behind-client'; // safe: player already consumed it
+            } else if (Date.now() - oldest.timestamp > SEGMENT_MAX_AGE_MS) {
+              reason = 'max-age'; // stale backstop: fetched-then-vanished clients
+            } else if (globalBufferedBytes > GLOBAL_BUFFER_BYTES && (session.bufferedBytes || 0) > SESSION_FLOOR_BYTES && clientPos >= 0 && oldest.seqNum <= clientPos) {
+              // Global pool exceeded -> fair-share valve. Only release bytes
+              // the client already fetched, and only until we hit the floor.
+              reason = 'global-pressure';
             } else {
-              // Client hasn't caught up yet, but we're at hard cap - drop oldest as last resort
-              const removed = session.segments.shift();
-              if (removed && removed.data) removed.data = null;
-              console.log(`[${new Date().toISOString()}] Buffering: Dropped segment ${removed.seqNum} (hard cap ${maxBufferSize}, client at ${clientPos})`);
+              break;
             }
+            const removed = session.segments.shift();
+            session.bufferedBytes -= removed.data.length;
+            globalBufferedBytes = Math.max(0, globalBufferedBytes - removed.data.length);
+            if (removed.data) removed.data = null;
+            if (reason === 'behind-client') droppedBehind++;
+            else if (reason === 'max-age') droppedAged++;
+            else droppedPressure++;
+          }
+          if (droppedBehind || droppedAged || droppedPressure) {
+            console.log(`[${new Date().toISOString()}] Buffering: Evicted segs (behind-client:${droppedBehind}, max-age:${droppedAged}, global-pressure:${droppedPressure}) | buffer: ${session.segments.length} segs, ${(session.bufferedBytes / 1048576).toFixed(1)}MB (budget ${Math.round(budget / 1048576)}MB), client at ${clientPos}, global pool ${(globalBufferedBytes / 1048576).toFixed(1)}/${Math.round(GLOBAL_BUFFER_BYTES / 1048576)}MB`);
           }
           
           // Reset for next segment
@@ -1151,7 +1211,6 @@ async function startBuffering(session, token) {
     }
     currentSegmentPackets = null;
     packetBuffer = null;
-    segmentCreationTimes = null;
     
     // Force immediate GC to release memory
     if (global.gc) {
@@ -1290,6 +1349,9 @@ app.get('/stream/:token.m3u8', async (req, res) => {
         portalResponse: null,
         startTime: Date.now(), // Track when stream started for timeout detection
         lastServedSeqNum: -1, // Highest segment number served to client (for buffer management)
+        bufferedBytes: 0, // Live bytes held in segments[] (per-session buffer accounting)
+        segmentBytesTotal: 0, // All segment bytes produced (for bitrate measurement)
+        segmentDurationTotal: 0, // All segment seconds produced (for bitrate measurement)
         playlistCache: null,  // Cached HLS playlist string
         playlistCacheTime: 0  // Timestamp of cached playlist
       };

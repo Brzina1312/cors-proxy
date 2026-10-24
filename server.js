@@ -346,34 +346,41 @@ const GLOBAL_BUFFER_BYTES = parseInt(process.env.GLOBAL_BUFFER_MB || '224', 10) 
 const SEGMENT_MAX_AGE_MS = parseInt(process.env.BUFFER_MAX_AGE_MS || '100000', 10);
 const KEEP_BEHIND = 2; // segments of rewind history kept behind the player's position
 
-// LIVE-EDGE HOLD-BACK: the newest HOLD_BACK_SEGS segments are kept in RAM but
-// NOT advertised in the playlist. Players glue themselves to the advertised
-// "live edge", so this gives every join a ready-made cushion of content that
-// is already buffered locally (fetched instantly, no portal dependency) and
-// keeps the seek bar away from the right edge of the window. Cost: playback
-// runs HOLD_BACK_SEGS x ~5s behind the portal's live edge (user-approved).
-const HOLD_BACK_SEGS = parseInt(process.env.HOLD_BACK_SEGS || '3', 10);
+// PLAYLIST PUBLISHING DESIGN ("pinned join -> full reveal")
+// Old working behavior (pre-redesign, f4763cc): first playlist response came
+// fast with the whole (small, ~15s) buffer advertised, and everything
+// buffered was always advertised afterwards. Players join at ~00:00 when the
+// advertised window is small, and once playing they never re-latch - so the
+// cushion (right side of the bar) simply grows. This file restores that
+// behavior with three robustness additions learned from logs:
+//   1. PINNED JOIN - while the player has NOT fetched any advertised segment
+//      (slow-booting Stremio engines poll playlists for 20-30s while ignoring
+//      them), the playlist keeps showing ONLY the oldest JOIN_WINDOW_SEGS
+//      segments. The window an edge-gluing player can latch onto stays at
+//      ~00:00 no matter when the engine finally boots. Segments beyond the
+//      join window are INVISIBLE to the player, so trimSessionBuffer is free
+//      to evict them under byte pressure - production never stalls, RAM stays
+//      flat, and no 15s of fresher content is ever "held back" unpublished
+//      (that was the edge-freeze deadlock).
+//   2. FULL REVEAL - the moment the player fetches its first advertised
+//      segment, EVERYTHING buffered is advertised at once (a big right-side
+//      cushion appears immediately) and publishing stays monotone forever:
+//      a claimed segment is never retracted and the edge never regresses.
+//   3. JOIN PROBE SAFETY VALVE - a playlist-only client that never fetches
+//      anything reveals +REVEAL_STEP_SEGS per playlist request after
+//      JOIN_PROBE_MAX_MS (gradual, NOT a jump to the deep buffer: a jump
+//      would glue a late booter onto a deep edge = "starts at 00:25").
+const JOIN_WINDOW_SEGS = parseInt(process.env.JOIN_WINDOW_SEGS || '3', 10);
+const JOIN_PROBE_MAX_MS = parseInt(process.env.JOIN_PROBE_MAX_MS || '45000', 10);
+const REVEAL_STEP_SEGS = parseInt(process.env.REVEAL_STEP_SEGS || '2', 10);
 
 // WINDOW DEPTH CAP: behind-client eviction only starts once the advertised
-// window is deeper than this, so the window GROWS from ~10-15s at join to this
+// window is deeper than this, so the window GROWS from ~15s at join to this
 // depth instead of being trimmed lean immediately (right side of the seek bar
 // increments as new segments are advertised). RAM stays bounded by the byte
 // budget/backpressure; this is the second guard (and the main one for
 // low-bitrate channels where the byte floor dominates).
 const MAX_WINDOW_SEGS = parseInt(process.env.MAX_WINDOW_SEGS || '12', 10);
-
-// JOIN PHASE: many players (ExoPlayer/VLC family) ignore #EXT-X-START and
-// glue onto the NEWEST advertised segment when they join. On a deep window
-// that lands the playhead near the buffered edge with nothing ahead of it -
-// the "starts at 00:35 of a 00:40 bar, hits the right side fast" bug on
-// slow-loading channels. Until the player actually fetches its first
-// advertised segment, the playlist therefore contains ONLY the oldest
-// JOIN_WINDOW_SEGS segments: the "live edge" such a player can glue on IS
-// ~00:00, and the right side of the seek bar then grows as the window
-// extends. RAM/backpressure keep bounding the buffer while it stockpiles
-// behind the tiny advertised window.
-const JOIN_WINDOW_SEGS = parseInt(process.env.JOIN_WINDOW_SEGS || '2', 10);
-const JOIN_PROBE_MAX_MS = parseInt(process.env.JOIN_PROBE_MAX_MS || '30000', 10);
 
 let globalBufferedBytes = 0; // total segment bytes held across all live sessions
 
@@ -538,22 +545,50 @@ function countBufferingSessions() {
   return n;
 }
 
-// Playback-aware buffer trim: a segment is ONLY dropped when the client has
-// already fetched it (or it aged out). Dropping a segment the player still
-// needs caused the 404 -> infinite stall loop on weak connections and slow
-// provider channels; unfetched content is never evicted here - byte
-// budget/backpressure handles slow fetchers. Returns dropped counters for
-// logging (nullish when nothing was evicted).
+// Playback-aware buffer trim: a segment the player can still name is only
+// dropped when the client has already fetched it (or it aged out) - dropping
+// a needed segment caused the 404 -> infinite stall loop on weak connections
+// and slow provider channels. EXCEPTION (PRE-FETCH VALVE): while the player
+// has never fetched anything (pinned join OR stepwise reveal), segments
+// beyond the published claim were never ADVERTISED to the player - they are
+// invisible, so they are droppable the moment RAM is needed. Returns dropped
+// counters for logging (nullish when nothing was evicted).
 function trimSessionBuffer(session) {
   const clientPos = session.lastServedSeqNum ?? -1;
+  const preFetch = clientPos < 0;
   const budget = computeSessionBudget(session, countBufferingSessions());
-  let droppedBehind = 0, droppedAged = 0, droppedPressure = 0;
+  let droppedBehind = 0, droppedAged = 0, droppedPressure = 0, droppedUnclaimed = 0;
+
+  // PRE-FETCH VALVE: drop the OLDEST unclaimed (unadvertised) segments while
+  // the session is over its byte budget, keeping the claim intact (mono-
+  // tone, no retract) and keeping the NEWEST unclaimed content so a later
+  // full reveal exposes naturally fresh bytes. This keeps the portal
+  // producing while a slow engine boots - without it the backpressure loop
+  // would pause reads behind a stockpiled backlog that only frees when the
+  // player finally arrives (or never).
+  if (preFetch && (session.publishedThrough ?? -1) >= 0) {
+    while ((session.bufferedBytes || 0) > budget) {
+      const idx = session.segments.findIndex(seg => seg.seqNum > session.publishedThrough);
+      if (idx < 0) break; // everything is claimed -> nothing visibly-free
+      const removed = session.segments.splice(idx, 1)[0];
+      session.bufferedBytes -= removed.data.length;
+      globalBufferedBytes = Math.max(0, globalBufferedBytes - removed.data.length);
+      if (removed.data) removed.data = null;
+      droppedUnclaimed++;
+    }
+  }
+
   while (session.segments.length > 0) {
     const oldest = session.segments[0];
     let reason = null;
+    // A CLAIMED segment is never dropped before the player fetches it - the
+    // playlist would retract an advertised entry (bar glitch/stall). The
+    // pre-fetch valve above already handles RAM for unclaimed content.
+    if (preFetch && oldest.seqNum <= (session.publishedThrough ?? -1)) break;
+    if (preFetch && Date.now() - oldest.timestamp <= SEGMENT_MAX_AGE_MS) break;
     // Behind-client eviction is normally DEFERRED until the advertised
     // window is deeper than MAX_WINDOW_SEGS: the window first grows from
-    // ~10-15s at join to the cap (right side of the seek bar increments),
+    // ~15s at join to the cap (right side of the seek bar increments),
     // then slides. BUT under session byte pressure it must fire immediately:
     // the session's byte budget can hold fewer than MAX_WINDOW_SEGS segments
     // on high-bitrate channels, so depth 12 would never be reached and
@@ -565,7 +600,7 @@ function trimSessionBuffer(session) {
         && ((session.segments[session.segments.length - 1].seqNum - oldest.seqNum) >= MAX_WINDOW_SEGS
             || (session.bufferedBytes || 0) > budget)) {
       reason = 'behind-client'; // safe: player already consumed it
-    } else if (Date.now() - oldest.timestamp > SEGMENT_MAX_AGE_MS) {
+    } else if (!preFetch && Date.now() - oldest.timestamp > SEGMENT_MAX_AGE_MS) {
       reason = 'max-age'; // stale backstop: fetched-then-vanished clients
     } else if (globalBufferedBytes > GLOBAL_BUFFER_BYTES && (session.bufferedBytes || 0) > SESSION_FLOOR_BYTES && clientPos >= 0 && oldest.seqNum <= clientPos) {
       // Global pool exceeded -> fair-share valve. Only release bytes
@@ -582,10 +617,10 @@ function trimSessionBuffer(session) {
     else if (reason === 'max-age') droppedAged++;
     else droppedPressure++;
   }
-  if (droppedBehind || droppedAged || droppedPressure) {
-    console.log(`[${new Date().toISOString()}] Buffering: Evicted segs (behind-client:${droppedBehind}, max-age:${droppedAged}, global-pressure:${droppedPressure}) | buffer: ${session.segments.length} segs, ${(session.bufferedBytes / 1048576).toFixed(1)}MB (budget ${Math.round(budget / 1048576)}MB), client at ${clientPos}, global pool ${(globalBufferedBytes / 1048576).toFixed(1)}/${Math.round(GLOBAL_BUFFER_BYTES / 1048576)}MB`);
+  if (droppedBehind || droppedAged || droppedPressure || droppedUnclaimed) {
+    console.log(`[${new Date().toISOString()}] Buffering: Evicted segs (behind-client:${droppedBehind}, max-age:${droppedAged}, global-pressure:${droppedPressure}, unclaimed:${droppedUnclaimed}) | buffer: ${session.segments.length} segs, ${(session.bufferedBytes / 1048576).toFixed(1)}MB (budget ${Math.round(budget / 1048576)}MB), client at ${clientPos}${preFetch ? ' [pre-fetch]' : ''}, global pool ${(globalBufferedBytes / 1048576).toFixed(1)}/${Math.round(GLOBAL_BUFFER_BYTES / 1048576)}MB`);
   }
-  return { droppedBehind, droppedAged, droppedPressure, budget, clientPos };
+  return { droppedBehind, droppedAged, droppedPressure, droppedUnclaimed, budget, clientPos };
 }
 
 // Immediately clean up a session (called on errors, disconnects, etc.)
@@ -1427,7 +1462,7 @@ app.get('/stream/:token.m3u8', async (req, res) => {
         lastServedSeqNum: -1, // Highest segment number served to client (for buffer management)
         publishedThrough: -1, // Highest seqNum ever advertised in a playlist (monotone, never retracted)
         joinWindow: true, // Join phase: advertise only the oldest JOIN_WINDOW_SEGS until the player fetches a segment
-        joinStartAt: 0, // Wall-clock when the join mini-window was first served (probe safety)
+        joinStartAt: 0, // Wall-clock when the pinned join window was first served (probe safety)
         first458At: null, // Start of the current continuous-458 streak (for hard458 failover signal)
         bufferedBytes: 0, // Live bytes held in segments[] (per-session buffer accounting)
         segmentBytesTotal: 0, // All segment bytes produced (for bitrate measurement)
@@ -1457,41 +1492,36 @@ app.get('/stream/:token.m3u8', async (req, res) => {
       session.lastAccess = Date.now();
     }
 
-    // Check playlist cache (reduces regeneration on rapid HLS refreshes)
-    // ExoPlayer refreshes every 3-5s; caching for 2s cuts requests by ~50%
-    const PLAYLIST_CACHE_TTL = 2000; // 2 seconds
-    if (session.playlistCache && Date.now() - session.playlistCacheTime < PLAYLIST_CACHE_TTL && session.segments.length > 0) {
-      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-      console.log(`[${new Date().toISOString()}] HLS Playlist sent (cached): ${session.segments.length} segments`);
-      return res.send(session.playlistCache);
-    }
-
-    // Generate playlist from actually buffered segments
-    const baseUrl = req.protocol + '://' + req.get('host');
-    const SEGMENT_DURATION = 5; // seconds
-
-    // JOIN PHASE management. Goals:
-    // 1. Live-edge-glued players must land at ~00:00 - while joinWindow is
-    //    active the playlist only contains the oldest JOIN_WINDOW_SEGS
-    //    segments, so the newest entry such a player latches onto IS the
-    //    window start. The buffer keeps stockpiling in the background.
-    // 2. The phase ends the moment the player fetches its first advertised
-    //    segment (healthy players fetch immediately), or after
-    //    JOIN_PROBE_MAX_MS as a safety valve so a playlist-only client can
-    //    never starve on a frozen tiny window.
+    // JOIN PHASE management ("pinned join -> full reveal", see constants).
+    // Runs FIRST so a phase transition (first fetch / probe expiry)
+    // invalidates the playlist cache before the cache check below can serve
+    // a playlist of the previous phase.
+    // 1. While joinWindow is active (player has fetched NOTHING yet) the
+    //    playlist keeps advertising ONLY the oldest JOIN_WINDOW_SEGS
+    //    segments, so the edge a live-glued player latches onto stays at
+    //    ~00:00 no matter how long its engine takes to boot.
+    // 2. The pin ends the moment the player fetches its first advertised
+    //    segment -> FULL REVEAL of everything buffered (instant big cushion).
+    // 3. A playlist-only client that never fetches anything is a safety
+    //    valve: after JOIN_PROBE_MAX_MS we reveal +REVEAL_STEP_SEGS per
+    //    playlist request (gradual - a jump to the deep buffer would glue a
+    //    late booter onto a deep edge, the "starts at 00:25" bug).
     if (session.joinWindow === undefined) session.joinWindow = true;
-    if (session.joinWindow && (session.lastServedSeqNum ?? -1) >= 0) {
-      session.joinWindow = false; // player took the first segments - expand
-      session.playlistCache = null;
-    }
     if (session.joinWindow && !session.joinStartAt) {
       session.joinStartAt = Date.now();
+    }
+    if (session.joinWindow && (session.lastServedSeqNum ?? -1) >= 0) {
+      // Player took the first segments - full reveal.
+      console.log(`[${new Date().toISOString()}] HLS Playlist: player fetched first segment, revealing full buffer (${session.segments.length} segs)`);
+      session.joinWindow = false;
+      session.playlistCache = null;
     } else if (session.joinWindow && session.joinStartAt
         && Date.now() - session.joinStartAt > JOIN_PROBE_MAX_MS) {
-      console.warn(`[${new Date().toISOString()}] HLS Playlist: join probe expired without segment fetch, expanding window`);
+      // Probe expired WITHOUT any fetch: keep the reveal gradual so a late
+      // booter tends to land on content near the join anchor, not the edge.
       session.joinWindow = false;
+      session.probeStepwise = true;
+      console.warn(`[${new Date().toISOString()}] HLS Playlist: join probe expired without segment fetch, revealing gradually (+${REVEAL_STEP_SEGS}/request)`);
       session.playlistCache = null;
     }
 
@@ -1499,14 +1529,10 @@ app.get('/stream/:token.m3u8', async (req, res) => {
     // yet. Up to 12s: on channel switches, the portal needs ~5-8s to release
     // the MAC's old stream slot (458) - waiting here lets the player's FIRST
     // playlist request come back WITH segments instead of the 503 retry loop.
-    // Join-phase gate: JOIN_WINDOW (what the playing edge sits on) +
-    // HOLD_BACK (reserve the hold-back rule will never publish early) + 2
-    // (immediate progression). Below that, a live-edge-glued player would
-    // exit the join with zero content published beyond its anchor, hug the
-    // right edge and stall - the exact bug this join phase fixes.
-    const minSegsNeeded = session.joinWindow
-      ? JOIN_WINDOW_SEGS + HOLD_BACK_SEGS + 2
-      : 1;
+    // Gate = the join window itself: once JOIN_WINDOW_SEGS (~15s) are
+    // buffered we SERVE - the old fast-join property. Deeper gates just add
+    // spinner time and let the backlog burst deepen the window (late join).
+    const minSegsNeeded = session.joinWindow ? JOIN_WINDOW_SEGS : 1;
     if (session.segments.length < minSegsNeeded) {
       console.log(`[${new Date().toISOString()}] Waiting for initial segments... (join=${session.joinWindow}, have ${session.segments.length}/${minSegsNeeded})`);
       const waitStart = Date.now();
@@ -1521,27 +1547,53 @@ app.get('/stream/:token.m3u8', async (req, res) => {
       return res.status(503).json({ error: 'Buffering in progress, try again' });
     }
 
-    // LIVE-EDGE HOLD-BACK (monotone publishing): advertise only segments at
-    // least HOLD_BACK_SEGS behind the buffer head, and NEVER retract a
-    // segment once advertised - live-edge-glued players break when the
-    // advertised edge regresses (bar glitch/stall). While the buffer is too
-    // young to hold anything back, advertise everything (an empty playlist
-    // is worse than no hold-back); publishedThrough only ever grows.
+    // Check playlist cache (reduces regeneration on rapid HLS refreshes)
+    // ExoPlayer refreshes every 3-5s; caching for 2s cuts requests by ~50%.
+    // Runs after join-phase management so a phase transition re-generates.
+    const PLAYLIST_CACHE_TTL = 2000; // 2 seconds
+    if (session.playlistCache && Date.now() - session.playlistCacheTime < PLAYLIST_CACHE_TTL && session.segments.length > 0) {
+      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      console.log(`[${new Date().toISOString()}] HLS Playlist sent (cached): ${session.playlistClaimed || 0} claimed of ${session.segments.length} buffered`);
+      return res.send(session.playlistCache);
+    }
+
+    // Generate playlist from actually buffered segments
+    const baseUrl = req.protocol + '://' + req.get('host');
+    const SEGMENT_DURATION = 5; // seconds
+
+    // MONOTONE PUBLISHING: everything buffered is advertised (old working
+    // behavior - the player prefetches what it can, and the seek bar's right
+    // side IS the buffer). Never retract a claimed segment and the edge
+    // never regresses: live-edge-glued players stall on retracted entries.
+    // While pinned, only the oldest JOIN_WINDOW_SEGS are claimed. While in
+    // stepwise reveal (probe expired, no fetch yet), the claim extends by
+    // REVEAL_STEP_SEGS per request from the previous claim.
     if (session.publishedThrough === undefined) session.publishedThrough = -1;
     if (session.joinWindow) {
-      for (const seg of session.segments.slice(0, JOIN_WINDOW_SEGS)) {
-        if (seg.seqNum > session.publishedThrough) session.publishedThrough = seg.seqNum;
-      }
-    } else if (session.segments.length > HOLD_BACK_SEGS) {
-      const edgeSeq = session.segments[session.segments.length - 1 - HOLD_BACK_SEGS].seqNum;
-      if (edgeSeq > session.publishedThrough) session.publishedThrough = edgeSeq;
+      const joinEdge = session.segments[Math.min(JOIN_WINDOW_SEGS, session.segments.length) - 1].seqNum;
+      if (joinEdge > session.publishedThrough) session.publishedThrough = joinEdge;
     } else {
       const newestSeq = session.segments[session.segments.length - 1].seqNum;
-      if (newestSeq > session.publishedThrough) session.publishedThrough = newestSeq;
+      let edgeSeq = newestSeq;
+      if (session.probeStepwise && (session.lastServedSeqNum ?? -1) < 0) {
+        // Gradual reveal; stepwise mode ends on the first segment fetch.
+        edgeSeq = Math.min(newestSeq, session.publishedThrough + REVEAL_STEP_SEGS);
+      }
+      if (edgeSeq > session.publishedThrough) session.publishedThrough = edgeSeq;
     }
-    const advertisedSegs = session.joinWindow
-      ? session.segments.slice(0, JOIN_WINDOW_SEGS)
-      : session.segments.filter(seg => seg.seqNum <= session.publishedThrough);
+    const advertisedSegs = session.segments.filter(seg => seg.seqNum <= session.publishedThrough);
+    if (advertisedSegs.length === 0) {
+      // Defense-in-depth: between requests the trim sweep can theoretically
+      // release every claimed-but-fetched segment while new content is still
+      // unpublished. An empty playlist would crash the response below - fall
+      // back to advertising the newest buffered segment (monotone claim).
+      const newest = session.segments[session.segments.length - 1];
+      session.publishedThrough = newest.seqNum;
+      advertisedSegs.push(newest);
+      console.warn(`[${new Date().toISOString()}] HLS Playlist: all claimed segs evicted between requests, advertising newest ${newest.seqNum}`);
+    }
 
     const oldestSegment = advertisedSegs[0].seqNum;
     const lines = [
@@ -1565,6 +1617,7 @@ app.get('/stream/:token.m3u8', async (req, res) => {
     // Cache the generated playlist (invalidated when new segments are created)
     session.playlistCache = playlist;
     session.playlistCacheTime = Date.now();
+    session.playlistClaimed = advertisedSegs.length;
 
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -1573,7 +1626,7 @@ app.get('/stream/:token.m3u8', async (req, res) => {
     res.send(playlist);
     
     const newestSegment = session.segments[session.segments.length - 1].seqNum;
-    console.log(`[${new Date().toISOString()}] HLS Playlist sent: ${advertisedSegs.length} advertised of ${session.segments.length} buffered (join=${session.joinWindow ? 'mini-window' : 'full'}, ${oldestSegment}-${advertisedSegs[advertisedSegs.length - 1].seqNum}${session.joinWindow ? '' : `, held back to ${newestSegment}`})`);
+    console.log(`[${new Date().toISOString()}] HLS Playlist sent: ${advertisedSegs.length} advertised of ${session.segments.length} buffered (join=${session.joinWindow ? 'pinned' : session.probeStepwise ? 'stepwise' : 'live'}, window ${oldestSegment}-${advertisedSegs[advertisedSegs.length - 1].seqNum}, buffered to ${newestSegment})`);
 
   } catch (error) {
     console.error(`[${new Date().toISOString()}] HLS playlist error:`, error.message);

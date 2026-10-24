@@ -538,6 +538,56 @@ function countBufferingSessions() {
   return n;
 }
 
+// Playback-aware buffer trim: a segment is ONLY dropped when the client has
+// already fetched it (or it aged out). Dropping a segment the player still
+// needs caused the 404 -> infinite stall loop on weak connections and slow
+// provider channels; unfetched content is never evicted here - byte
+// budget/backpressure handles slow fetchers. Returns dropped counters for
+// logging (nullish when nothing was evicted).
+function trimSessionBuffer(session) {
+  const clientPos = session.lastServedSeqNum ?? -1;
+  const budget = computeSessionBudget(session, countBufferingSessions());
+  let droppedBehind = 0, droppedAged = 0, droppedPressure = 0;
+  while (session.segments.length > 0) {
+    const oldest = session.segments[0];
+    let reason = null;
+    // Behind-client eviction is normally DEFERRED until the advertised
+    // window is deeper than MAX_WINDOW_SEGS: the window first grows from
+    // ~10-15s at join to the cap (right side of the seek bar increments),
+    // then slides. BUT under session byte pressure it must fire immediately:
+    // the session's byte budget can hold fewer than MAX_WINDOW_SEGS segments
+    // on high-bitrate channels, so depth 12 would never be reached and
+    // bufferedBytes could never shrink -> backpressure never releases and
+    // playback starves behind a frozen published edge (the "play/pause
+    // forever at 00:19" deadlock). Only player-fetched segments ever go
+    // this way - safe. Oldest -> newest keeps seq order contiguous.
+    if (clientPos >= 0 && oldest.seqNum <= clientPos - KEEP_BEHIND
+        && ((session.segments[session.segments.length - 1].seqNum - oldest.seqNum) >= MAX_WINDOW_SEGS
+            || (session.bufferedBytes || 0) > budget)) {
+      reason = 'behind-client'; // safe: player already consumed it
+    } else if (Date.now() - oldest.timestamp > SEGMENT_MAX_AGE_MS) {
+      reason = 'max-age'; // stale backstop: fetched-then-vanished clients
+    } else if (globalBufferedBytes > GLOBAL_BUFFER_BYTES && (session.bufferedBytes || 0) > SESSION_FLOOR_BYTES && clientPos >= 0 && oldest.seqNum <= clientPos) {
+      // Global pool exceeded -> fair-share valve. Only release bytes
+      // the client already fetched, and only until we hit the floor.
+      reason = 'global-pressure';
+    } else {
+      break;
+    }
+    const removed = session.segments.shift();
+    session.bufferedBytes -= removed.data.length;
+    globalBufferedBytes = Math.max(0, globalBufferedBytes - removed.data.length);
+    if (removed.data) removed.data = null;
+    if (reason === 'behind-client') droppedBehind++;
+    else if (reason === 'max-age') droppedAged++;
+    else droppedPressure++;
+  }
+  if (droppedBehind || droppedAged || droppedPressure) {
+    console.log(`[${new Date().toISOString()}] Buffering: Evicted segs (behind-client:${droppedBehind}, max-age:${droppedAged}, global-pressure:${droppedPressure}) | buffer: ${session.segments.length} segs, ${(session.bufferedBytes / 1048576).toFixed(1)}MB (budget ${Math.round(budget / 1048576)}MB), client at ${clientPos}, global pool ${(globalBufferedBytes / 1048576).toFixed(1)}/${Math.round(GLOBAL_BUFFER_BYTES / 1048576)}MB`);
+  }
+  return { droppedBehind, droppedAged, droppedPressure, budget, clientPos };
+}
+
 // Immediately clean up a session (called on errors, disconnects, etc.)
 function cleanupSession(token, reason = 'cleanup') {
   const session = sessionNormalizers.get(token);
@@ -883,11 +933,19 @@ async function startBuffering(session, token) {
   try {
     while (session.isBuffering && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
     try {
-      // Backpressure: if the buffer is still over budget after eviction,
-      // stop pulling from the portal for a beat. TCP backpressure slows
-      // production naturally instead of dropping data the player needs.
-      const bpOver = session.segments && session.segments.length > 0 &&
+      // Backpressure: if the buffer is still over budget after an eviction
+      // sweep, stop pulling from the portal for a beat. TCP backpressure
+      // slows production naturally instead of dropping data the player
+      // needs. The sweep runs FIRST - it releases consumed-chain bytes so a
+      // momentary pile-up (e.g. a backlog gush from the portal at connect)
+      // resolves without ever pausing the stream.
+      let bpOver = session.segments && session.segments.length > 0 &&
         (session.bufferedBytes || 0) > computeSessionBudget(session, countBufferingSessions());
+      if (bpOver) {
+        trimSessionBuffer(session);
+        bpOver = session.segments.length > 0 &&
+          (session.bufferedBytes || 0) > computeSessionBudget(session, countBufferingSessions());
+      }
       if (bpOver) {
         if (!bpLogging) {
           bpLogging = true;
@@ -1162,46 +1220,10 @@ async function startBuffering(session, token) {
           session.segmentDurationTotal = (session.segmentDurationTotal || 0) + actualDuration;
           globalBufferedBytes += segmentData.length;
 
-          // Playback-aware buffer management: a segment is ONLY dropped when
-          // the client has already fetched it (or it aged out). Dropping a
-          // segment the player still needs caused the 404 -> infinite stall
-          // loop on weak connections and slow provider channels.
-          const clientPos = session.lastServedSeqNum ?? -1;
-          const activeCount = countBufferingSessions();
-          const budget = computeSessionBudget(session, activeCount);
-          let droppedBehind = 0, droppedAged = 0, droppedPressure = 0;
-          while (session.segments.length > 0) {
-            const oldest = session.segments[0];
-            let reason = null;
-            // Behind-client eviction is DELAYED until the window is deeper
-            // than MAX_WINDOW_SEGS: the advertised window first grows from
-            // ~10-15s at join to the cap (right side of the seek bar
-            // increments), then slides. Only segments the player already
-            // fetched are ever dropped this way - unfetched content is never
-            // evicted here (byte budget/backpressure handles slow fetchers).
-            if (clientPos >= 0 && oldest.seqNum <= clientPos - KEEP_BEHIND
-                && (newestSeq - oldest.seqNum) >= MAX_WINDOW_SEGS) {
-              reason = 'behind-client'; // safe: player already consumed it
-            } else if (Date.now() - oldest.timestamp > SEGMENT_MAX_AGE_MS) {
-              reason = 'max-age'; // stale backstop: fetched-then-vanished clients
-            } else if (globalBufferedBytes > GLOBAL_BUFFER_BYTES && (session.bufferedBytes || 0) > SESSION_FLOOR_BYTES && clientPos >= 0 && oldest.seqNum <= clientPos) {
-              // Global pool exceeded -> fair-share valve. Only release bytes
-              // the client already fetched, and only until we hit the floor.
-              reason = 'global-pressure';
-            } else {
-              break;
-            }
-            const removed = session.segments.shift();
-            session.bufferedBytes -= removed.data.length;
-            globalBufferedBytes = Math.max(0, globalBufferedBytes - removed.data.length);
-            if (removed.data) removed.data = null;
-            if (reason === 'behind-client') droppedBehind++;
-            else if (reason === 'max-age') droppedAged++;
-            else droppedPressure++;
-          }
-          if (droppedBehind || droppedAged || droppedPressure) {
-            console.log(`[${new Date().toISOString()}] Buffering: Evicted segs (behind-client:${droppedBehind}, max-age:${droppedAged}, global-pressure:${droppedPressure}) | buffer: ${session.segments.length} segs, ${(session.bufferedBytes / 1048576).toFixed(1)}MB (budget ${Math.round(budget / 1048576)}MB), client at ${clientPos}, global pool ${(globalBufferedBytes / 1048576).toFixed(1)}/${Math.round(GLOBAL_BUFFER_BYTES / 1048576)}MB`);
-          }
+          // Playback-aware buffer management: trim only player-fetched or
+          // aged-out segments (see trimSessionBuffer - drops nothing the
+          // player still needs).
+          trimSessionBuffer(session);
           
           // Reset for next segment
           currentSegmentPackets = [];

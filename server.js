@@ -345,6 +345,23 @@ const SESSION_HARD_CAP_BYTES = parseInt(process.env.BUFFER_CAP_MB || '64', 10) *
 const GLOBAL_BUFFER_BYTES = parseInt(process.env.GLOBAL_BUFFER_MB || '224', 10) * 1024 * 1024;
 const SEGMENT_MAX_AGE_MS = parseInt(process.env.BUFFER_MAX_AGE_MS || '100000', 10);
 const KEEP_BEHIND = 2; // segments of rewind history kept behind the player's position
+
+// LIVE-EDGE HOLD-BACK: the newest HOLD_BACK_SEGS segments are kept in RAM but
+// NOT advertised in the playlist. Players glue themselves to the advertised
+// "live edge", so this gives every join a ready-made cushion of content that
+// is already buffered locally (fetched instantly, no portal dependency) and
+// keeps the seek bar away from the right edge of the window. Cost: playback
+// runs HOLD_BACK_SEGS x ~5s behind the portal's live edge (user-approved).
+const HOLD_BACK_SEGS = parseInt(process.env.HOLD_BACK_SEGS || '3', 10);
+
+// WINDOW DEPTH CAP: behind-client eviction only starts once the advertised
+// window is deeper than this, so the window GROWS from ~10-15s at join to this
+// depth instead of being trimmed lean immediately (right side of the seek bar
+// increments as new segments are advertised). RAM stays bounded by the byte
+// budget/backpressure; this is the second guard (and the main one for
+// low-bitrate channels where the byte floor dominates).
+const MAX_WINDOW_SEGS = parseInt(process.env.MAX_WINDOW_SEGS || '12', 10);
+
 let globalBufferedBytes = 0; // total segment bytes held across all live sessions
 
 // Protection: Per-MAC concurrent session blocking (one connection per MAC at a time)
@@ -1143,7 +1160,14 @@ async function startBuffering(session, token) {
           while (session.segments.length > 0) {
             const oldest = session.segments[0];
             let reason = null;
-            if (clientPos >= 0 && oldest.seqNum <= clientPos - KEEP_BEHIND) {
+            // Behind-client eviction is DELAYED until the window is deeper
+            // than MAX_WINDOW_SEGS: the advertised window first grows from
+            // ~10-15s at join to the cap (right side of the seek bar
+            // increments), then slides. Only segments the player already
+            // fetched are ever dropped this way - unfetched content is never
+            // evicted here (byte budget/backpressure handles slow fetchers).
+            if (clientPos >= 0 && oldest.seqNum <= clientPos - KEEP_BEHIND
+                && (newestSeq - oldest.seqNum) >= MAX_WINDOW_SEGS) {
               reason = 'behind-client'; // safe: player already consumed it
             } else if (Date.now() - oldest.timestamp > SEGMENT_MAX_AGE_MS) {
               reason = 'max-age'; // stale backstop: fetched-then-vanished clients
@@ -1413,12 +1437,15 @@ app.get('/stream/:token.m3u8', async (req, res) => {
     // Wait briefly for initial segments if buffer is empty
     // Up to 12s: on channel switches, the portal needs ~5-8s to release the
     // MAC's old stream slot (458) - waiting here lets the player's FIRST
-    // playlist request come back WITH segments instead of the 503 retry loop
+    // playlist request come back WITH segments instead of the 503 retry loop.
+    // Threshold = HOLD_BACK_SEGS + 2 so the first advertised window already
+    // carries ~10s of playable content plus the hold-back cushion.
+    const INITIAL_MIN_SEGS = HOLD_BACK_SEGS + 2;
     if (session.segments.length === 0) {
       console.log(`[${new Date().toISOString()}] Waiting for initial segments...`);
       const waitStart = Date.now();
       const WAIT_WINDOW = 12000; // up to 12s total
-      while (session.segments.length < 3 && Date.now() - waitStart < WAIT_WINDOW && session.isBuffering) {
+      while (session.segments.length < INITIAL_MIN_SEGS && Date.now() - waitStart < WAIT_WINDOW && session.isBuffering) {
         await new Promise(resolve => setTimeout(resolve, 250));
       }
     }
@@ -1427,17 +1454,31 @@ app.get('/stream/:token.m3u8', async (req, res) => {
       console.warn(`[${new Date().toISOString()}] No segments available yet`);
       return res.status(503).json({ error: 'Buffering in progress, try again' });
     }
-    
-    const oldestSegment = session.segments[0].seqNum;
+
+    // LIVE-EDGE HOLD-BACK: advertise only segments that are at least
+    // HOLD_BACK_SEGS behind the buffer head. The player joins at/near the
+    // ADVERTISED edge, giving it a ready-made cushion of locally buffered
+    // content; the seek bar never hugs the right side of the window because
+    // new segments keep extending it while the cushion stays ahead of the
+    // playhead. If the buffer is still tiny (early join / wait timeout),
+    // advertise everything - an empty playlist is worse than no hold-back.
+    const advertisedSegs = session.segments.length > HOLD_BACK_SEGS
+      ? session.segments.slice(0, session.segments.length - HOLD_BACK_SEGS)
+      : session.segments;
+
+    const oldestSegment = advertisedSegs[0].seqNum;
     const lines = [
       '#EXTM3U',
       '#EXT-X-VERSION:3',
       '#EXT-X-TARGETDURATION:10',  // Max segment duration (clamped to 10s in normalizer)
+      // Start at the beginning of the advertised window (position 00:00) -
+      // honored by spec-compliant players, ignored harmlessly by the rest.
+      '#EXT-X-START:TIME-OFFSET=0',
       `#EXT-X-MEDIA-SEQUENCE:${oldestSegment}`
     ];
     
-    // Add all buffered segments
-    for (const seg of session.segments) {
+    // Add all advertised segments
+    for (const seg of advertisedSegs) {
       lines.push(`#EXTINF:${seg.duration.toFixed(3)},`);
       lines.push(`${baseUrl}/stream/${token}/seg/${seg.seqNum}.ts`);
     }
@@ -1455,7 +1496,7 @@ app.get('/stream/:token.m3u8', async (req, res) => {
     res.send(playlist);
     
     const newestSegment = session.segments[session.segments.length - 1].seqNum;
-    console.log(`[${new Date().toISOString()}] HLS Playlist sent: ${session.segments.length} segments (${oldestSegment}-${newestSegment})`);;
+    console.log(`[${new Date().toISOString()}] HLS Playlist sent: ${advertisedSegs.length} advertised of ${session.segments.length} buffered (${oldestSegment}-${advertisedSegs[advertisedSegs.length - 1].seqNum}, held back to ${newestSegment})`);;
 
   } catch (error) {
     console.error(`[${new Date().toISOString()}] HLS playlist error:`, error.message);
